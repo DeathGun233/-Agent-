@@ -4,7 +4,9 @@ import json
 import re
 from collections import Counter
 from statistics import mean
-from typing import Any
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
 
 from app.config import Settings
 from app.data import RISK_CUSTOMERS, SALES_DATA, WORKFLOW_TEMPLATES
@@ -19,6 +21,15 @@ WORKFLOW_TITLES = {
     WorkflowType.SUPPORT_TRIAGE: "客服工单智能分流",
     WorkflowType.MEETING_MINUTES: "会议纪要转执行系统",
 }
+
+
+class WorkflowState(TypedDict, total=False):
+    request: WorkflowRequest
+    run: WorkflowRun
+    raw_result: dict[str, Any]
+    analysis: dict[str, Any]
+    deliverables: dict[str, Any]
+    review: ReviewDecision
 
 
 class PlannerAgent:
@@ -375,7 +386,6 @@ class ReviewerAgent:
             if reason and reason not in merged_reasons:
                 merged_reasons.append(reason)
 
-        # Hard safety gates always win. The model can make the review stricter, but not looser.
         if rule_payload.get("needs_human_review"):
             return {
                 "status": RunStatus.WAITING_HUMAN.value,
@@ -403,6 +413,8 @@ class WorkflowEngine:
         self.analyst = AnalystAgent(self.llm)
         self.content = ContentAgent(self.llm)
         self.reviewer = ReviewerAgent(self.llm)
+        self.graph = self._build_graph()
+        self.graph_definition = self._build_graph_definition()
 
     def list_templates(self) -> list[dict[str, Any]]:
         return [template.model_dump(mode="json") for template in WORKFLOW_TEMPLATES]
@@ -413,55 +425,163 @@ class WorkflowEngine:
     def get_run(self, run_id: str) -> WorkflowRun | None:
         return self.repository.get(run_id)
 
+    def get_graph_definition(self) -> dict[str, Any]:
+        return self.graph_definition
+
     def run_workflow(self, request: WorkflowRequest) -> WorkflowRun:
         run = WorkflowRun(workflow_type=request.workflow_type, input_payload=request.input_payload)
         self.repository.save(run)
+        final_state = self.graph.invoke({"request": request, "run": run})
+        final_run = final_state["run"]
+        self.repository.save(final_run)
+        return final_run
 
+    def _build_graph(self):
+        builder = StateGraph(WorkflowState)
+        builder.add_node("planner", self._planner_node)
+        builder.add_node("operator", self._operator_node)
+        builder.add_node("analyst", self._analyst_node)
+        builder.add_node("content", self._content_node)
+        builder.add_node("reviewer", self._reviewer_node)
+        builder.add_node("complete_run", self._complete_node)
+        builder.add_node("handoff_run", self._handoff_node)
+
+        builder.add_edge(START, "planner")
+        builder.add_edge("planner", "operator")
+        builder.add_edge("operator", "analyst")
+        builder.add_edge("analyst", "content")
+        builder.add_edge("content", "reviewer")
+        builder.add_conditional_edges(
+            "reviewer",
+            self._route_after_review,
+            {
+                "complete": "complete_run",
+                "handoff": "handoff_run",
+            },
+        )
+        builder.add_edge("complete_run", END)
+        builder.add_edge("handoff_run", END)
+        return builder.compile()
+
+    def _build_graph_definition(self) -> dict[str, Any]:
+        return {
+            "runtime": "langgraph",
+            "entrypoint": "planner",
+            "nodes": [
+                "planner",
+                "operator",
+                "analyst",
+                "content",
+                "reviewer",
+                "complete_run",
+                "handoff_run",
+            ],
+            "edges": [
+                {"from": "START", "to": "planner"},
+                {"from": "planner", "to": "operator"},
+                {"from": "operator", "to": "analyst"},
+                {"from": "analyst", "to": "content"},
+                {"from": "content", "to": "reviewer"},
+                {"from": "reviewer", "to": "complete_run", "condition": "review.status == completed"},
+                {"from": "reviewer", "to": "handoff_run", "condition": "review.status == waiting_human"},
+                {"from": "complete_run", "to": "END"},
+                {"from": "handoff_run", "to": "END"},
+            ],
+        }
+
+    def _planner_node(self, state: WorkflowState) -> WorkflowState:
+        request = state["request"]
+        run = state["run"]
         run.touch(status=RunStatus.PLANNING, current_step="planning")
         plan = self.planner.build_plan(request)
         run.plan = plan
         run.objective = plan.objective
         run.add_log("PlannerAgent", f"已生成执行计划，共 {len(plan.steps)} 步。")
+        self.repository.save(run)
+        return {"run": run}
 
-        run.touch(status=RunStatus.EXECUTING, current_step="tool_execution")
+    def _operator_node(self, state: WorkflowState) -> WorkflowState:
+        request = state["request"]
+        run = state["run"]
         raw_result, tool_name = self._execute_tool(request.workflow_type, request.input_payload)
+        run.touch(status=RunStatus.EXECUTING, current_step="tool_execution")
         run.add_log(
             "OperatorAgent",
             f"完成工具调用：{tool_name}",
             tool_call=ToolCall(name=tool_name, input=request.input_payload, output=raw_result),
         )
+        self.repository.save(run)
+        return {"run": run, "raw_result": raw_result}
 
+    def _analyst_node(self, state: WorkflowState) -> WorkflowState:
+        request = state["request"]
+        run = state["run"]
+        raw_result = state["raw_result"]
         analysis = self.analyst.analyze(request.workflow_type, raw_result)
+        run.touch(status=RunStatus.EXECUTING, current_step="analysis")
         run.add_log(
             "AnalystAgent",
             "已完成结果分析与行动建议整理。"
             + ("（已调用真实模型）" if self.llm.enabled else "（当前为本地回退策略）"),
         )
+        self.repository.save(run)
+        return {"run": run, "analysis": analysis}
 
-        content = self.content.refine(request.workflow_type, raw_result, analysis)
+    def _content_node(self, state: WorkflowState) -> WorkflowState:
+        request = state["request"]
+        run = state["run"]
+        raw_result = state["raw_result"]
+        analysis = state["analysis"]
+        deliverables = self.content.refine(request.workflow_type, raw_result, analysis)
+        run.touch(status=RunStatus.EXECUTING, current_step="content")
         run.add_log(
             "ContentAgent",
             "已补充业务可直接使用的输出内容。"
             + ("（已调用真实模型）" if self.llm.enabled else "（当前为本地回退策略）"),
         )
+        self.repository.save(run)
+        return {"run": run, "deliverables": deliverables}
 
-        run.touch(status=RunStatus.REVIEWING, current_step="review")
+    def _reviewer_node(self, state: WorkflowState) -> WorkflowState:
+        request = state["request"]
+        run = state["run"]
+        raw_result = state["raw_result"]
+        analysis = state["analysis"]
         review = self.reviewer.review(request.workflow_type, raw_result, analysis)
+        run.touch(status=RunStatus.REVIEWING, current_step="review")
         run.review = review
+        run.result = {
+            "raw_result": raw_result,
+            "analysis": analysis,
+            "deliverables": state["deliverables"],
+        }
         run.add_log(
             "ReviewerAgent",
             "已完成质量审核与人工接管判断。"
             + ("（已调用真实模型）" if self.llm.enabled else "（当前为本地回退策略）"),
         )
-
-        run.result = {
-            "raw_result": raw_result,
-            "analysis": analysis,
-            "deliverables": content,
-        }
-        run.touch(status=review.status, current_step="done")
         self.repository.save(run)
-        return run
+        return {"run": run, "review": review}
+
+    def _complete_node(self, state: WorkflowState) -> WorkflowState:
+        run = state["run"]
+        review = state["review"]
+        run.touch(status=RunStatus(review.status), current_step="done")
+        run.add_log("WorkflowRuntime", "LangGraph 状态流已自动完成本次工作流。")
+        self.repository.save(run)
+        return {"run": run}
+
+    def _handoff_node(self, state: WorkflowState) -> WorkflowState:
+        run = state["run"]
+        run.touch(status=RunStatus.WAITING_HUMAN, current_step="waiting_human")
+        run.add_log("WorkflowRuntime", "LangGraph 状态流已将该任务转入人工接管。")
+        self.repository.save(run)
+        return {"run": run}
+
+    @staticmethod
+    def _route_after_review(state: WorkflowState) -> str:
+        review = state["review"]
+        return "handoff" if review.status == RunStatus.WAITING_HUMAN else "complete"
 
     def _execute_tool(self, workflow_type: WorkflowType, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         if workflow_type == WorkflowType.SALES_FOLLOWUP:

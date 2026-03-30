@@ -60,6 +60,11 @@ def list_runs() -> list[dict]:
     return [run.model_dump(mode="json") for run in engine.list_runs()]
 
 
+@app.get("/api/workflows/graph")
+def get_workflow_graph() -> dict:
+    return engine.get_graph_definition()
+
+
 @app.get("/api/workflows/{run_id}")
 def get_run(run_id: str) -> dict:
     run = engine.get_run(run_id)

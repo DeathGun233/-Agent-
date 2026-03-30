@@ -15,6 +15,15 @@ def test_health_endpoint_exposes_backend_shape() -> None:
     assert "redis_enabled" in body
 
 
+def test_graph_endpoint_exposes_langgraph_shape() -> None:
+    response = client.get("/api/workflows/graph")
+    body = response.json()
+    assert response.status_code == 200
+    assert body["runtime"] == "langgraph"
+    assert "planner" in body["nodes"]
+    assert any(edge["from"] == "reviewer" for edge in body["edges"])
+
+
 def test_templates_available() -> None:
     response = client.get("/api/workflows/templates")
     assert response.status_code == 200
@@ -37,6 +46,7 @@ def test_sales_workflow_runs() -> None:
     assert response.status_code == 200
     assert body["result"]["raw_result"]["summary"]["lead_count"] > 0
     assert body["review"]["status"] in {"completed", "waiting_human"}
+    assert any("LangGraph 状态流" in log["message"] for log in body["logs"])
 
 
 def test_support_workflow_flags_human_review() -> None:
@@ -58,6 +68,7 @@ def test_support_workflow_flags_human_review() -> None:
     assert response.status_code == 200
     assert body["review"]["needs_human_review"] is True
     assert body["status"] == "waiting_human"
+    assert any("人工接管" in log["message"] for log in body["logs"])
 
 
 def test_meeting_workflow_extracts_actions() -> None:
