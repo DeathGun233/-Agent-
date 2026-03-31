@@ -323,6 +323,22 @@ class ContentAgent:
 
 
 class ReviewerAgent:
+    AUTO_EXECUTE_HINTS = (
+        "可直接流转执行",
+        "可直接执行",
+        "结果结构完整",
+        "自动完成",
+    )
+    MANUAL_REVIEW_HINTS = (
+        "人工",
+        "复核",
+        "确认",
+        "升级",
+        "待确认",
+        "风险",
+        "合规",
+    )
+
     def __init__(self, llm: LLMService) -> None:
         self.llm = llm
 
@@ -387,20 +403,44 @@ class ReviewerAgent:
                 merged_reasons.append(reason)
 
         if rule_payload.get("needs_human_review"):
+            final_status = RunStatus.WAITING_HUMAN.value
             return {
-                "status": RunStatus.WAITING_HUMAN.value,
+                "status": final_status,
                 "needs_human_review": True,
                 "score": min(float(rule_payload.get("score", 1.0)), float(llm_payload.get("score", 1.0))),
-                "reasons": merged_reasons,
+                "reasons": ReviewerAgent._normalize_reasons_for_status(merged_reasons, final_status),
             }
 
         llm_requests_handoff = bool(llm_payload.get("needs_human_review")) or llm_payload.get("status") == RunStatus.WAITING_HUMAN.value
+        final_status = RunStatus.WAITING_HUMAN.value if llm_requests_handoff else RunStatus.COMPLETED.value
         return {
-            "status": RunStatus.WAITING_HUMAN.value if llm_requests_handoff else RunStatus.COMPLETED.value,
+            "status": final_status,
             "needs_human_review": llm_requests_handoff,
             "score": float(llm_payload.get("score", rule_payload.get("score", 0.9))),
-            "reasons": merged_reasons or rule_payload.get("reasons", []),
+            "reasons": ReviewerAgent._normalize_reasons_for_status(
+                merged_reasons or rule_payload.get("reasons", []),
+                final_status,
+            ),
         }
+
+    @classmethod
+    def _normalize_reasons_for_status(cls, reasons: list[str], status: str) -> list[str]:
+        cleaned = [reason.strip() for reason in reasons if reason and reason.strip()]
+        if status == RunStatus.WAITING_HUMAN.value:
+            filtered = [reason for reason in cleaned if not cls._is_auto_execute_reason(reason)]
+            return filtered or ["需要人工确认后再继续流转。"]
+        if status == RunStatus.COMPLETED.value:
+            filtered = [reason for reason in cleaned if not cls._is_manual_review_reason(reason)]
+            return filtered or ["结果结构完整，可直接流转执行。"]
+        return cleaned
+
+    @classmethod
+    def _is_auto_execute_reason(cls, reason: str) -> bool:
+        return any(hint in reason for hint in cls.AUTO_EXECUTE_HINTS)
+
+    @classmethod
+    def _is_manual_review_reason(cls, reason: str) -> bool:
+        return any(hint in reason for hint in cls.MANUAL_REVIEW_HINTS)
 
 
 class WorkflowEngine:

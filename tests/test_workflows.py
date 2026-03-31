@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from app.db import UserAccountRecord
 from app.main import app, database
+from app.services import ReviewerAgent
 
 
 client = TestClient(app)
@@ -105,6 +106,27 @@ def test_sales_workflow_runs() -> None:
     assert body["result"]["raw_result"]["summary"]["lead_count"] > 0
     assert body["review"]["status"] in {"completed", "waiting_human"}
     assert any("LangGraph 状态流" in log["message"] for log in body["logs"])
+
+
+def test_waiting_human_reasons_do_not_include_auto_execute_copy() -> None:
+    merged = ReviewerAgent._merge_review(
+        {
+            "status": "completed",
+            "needs_human_review": False,
+            "score": 0.92,
+            "reasons": ["结果结构完整，可直接流转执行。"],
+        },
+        {
+            "status": "waiting_human",
+            "needs_human_review": True,
+            "score": 0.65,
+            "reasons": ["需人工确认一对一辅导计划及风险客户跟进策略的可行性与资源支持"],
+        },
+    )
+    assert merged["status"] == "waiting_human"
+    assert merged["needs_human_review"] is True
+    assert all("可直接流转执行" not in reason for reason in merged["reasons"])
+    assert any("人工" in reason for reason in merged["reasons"])
 
 
 def test_support_workflow_flags_human_review_and_can_be_approved() -> None:
