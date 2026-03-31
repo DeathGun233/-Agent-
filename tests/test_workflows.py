@@ -106,6 +106,10 @@ def test_sales_workflow_runs() -> None:
     assert body["result"]["raw_result"]["summary"]["lead_count"] > 0
     assert body["review"]["status"] in {"completed", "waiting_human"}
     assert any("LangGraph 状态流" in log["message"] for log in body["logs"])
+    llm_logs = [log for log in body["logs"] if log.get("llm_call")]
+    assert len(llm_logs) == 3
+    assert all(log["llm_call"]["model_name"] == "qwen3-max" for log in llm_logs)
+    assert all("system_prompt" in log["llm_call"] for log in llm_logs)
 
 
 def test_waiting_human_reasons_do_not_include_auto_execute_copy() -> None:
@@ -179,4 +183,5 @@ def test_detail_page_contains_graphic_timeline() -> None:
     assert detail.status_code == 200
     assert "图形化执行时间线" in detail.text
     assert "执行日志" in detail.text
+    assert "AI 运行指标" in detail.text
     assert "结果 JSON" in detail.text

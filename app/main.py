@@ -117,6 +117,32 @@ def _build_run_table(runs: list[WorkflowRun]) -> list[dict]:
     ]
 
 
+def _build_llm_summary(run: WorkflowRun) -> dict[str, object]:
+    llm_calls = [log.llm_call for log in run.logs if log.llm_call is not None]
+    if not llm_calls:
+        return {
+            "total_requests": 0,
+            "model_names": [],
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "total_latency_ms": 0,
+            "avg_latency_ms": 0,
+            "fallback_requests": 0,
+        }
+    total_latency_ms = sum(call.latency_ms for call in llm_calls)
+    return {
+        "total_requests": len(llm_calls),
+        "model_names": sorted({call.model_name for call in llm_calls}),
+        "prompt_tokens": sum(call.prompt_tokens for call in llm_calls),
+        "completion_tokens": sum(call.completion_tokens for call in llm_calls),
+        "total_tokens": sum(call.total_tokens for call in llm_calls),
+        "total_latency_ms": total_latency_ms,
+        "avg_latency_ms": round(total_latency_ms / len(llm_calls)),
+        "fallback_requests": sum(1 for call in llm_calls if call.used_fallback),
+    }
+
+
 def _common_context(request: Request, user: AuthUser, active_page: str, **kwargs: object) -> dict[str, object]:
     return {
         "request": request,
@@ -287,6 +313,7 @@ def run_detail_page(run_id: str, request: Request):
                 "updated_at": run.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                 "created_at": run.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
             },
+            llm_summary=_build_llm_summary(run),
             graph=engine.get_graph_definition(),
         ),
     )

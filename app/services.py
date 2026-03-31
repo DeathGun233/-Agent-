@@ -11,7 +11,7 @@ from langgraph.graph import END, START, StateGraph
 from app.config import Settings
 from app.data import RISK_CUSTOMERS, SALES_DATA, WORKFLOW_TEMPLATES
 from app.llm import LLMService
-from app.models import ReviewDecision, RunStatus, ToolCall, WorkflowPlan, WorkflowRequest, WorkflowRun, WorkflowType
+from app.models import LLMCall, ReviewDecision, RunStatus, ToolCall, WorkflowPlan, WorkflowRequest, WorkflowRun, WorkflowType
 from app.repository import WorkflowRepository
 
 
@@ -214,14 +214,14 @@ class AnalystAgent:
     def __init__(self, llm: LLMService) -> None:
         self.llm = llm
 
-    def analyze(self, workflow_type: WorkflowType, raw_result: dict[str, Any]) -> dict[str, Any]:
+    def analyze(self, workflow_type: WorkflowType, raw_result: dict[str, Any]) -> tuple[dict[str, Any], LLMCall]:
         fallback = self._fallback_analysis(workflow_type, raw_result)
         prompt = {
             "workflow_type": workflow_type.value,
             "raw_result": raw_result,
             "required_keys": ["insights", "action_plan"],
         }
-        return self.llm.generate_json(
+        response = self.llm.generate_json(
             system_prompt=(
                 "你是企业工作流平台中的 Analyst Agent。"
                 "请根据输入数据输出纯 JSON，必须包含 insights 和 action_plan 两个数组，"
@@ -230,6 +230,7 @@ class AnalystAgent:
             user_prompt=json.dumps(prompt, ensure_ascii=False),
             fallback=fallback,
         )
+        return response.payload, response.call
 
     @staticmethod
     def _fallback_analysis(workflow_type: WorkflowType, raw_result: dict[str, Any]) -> dict[str, Any]:
@@ -288,7 +289,12 @@ class ContentAgent:
     def __init__(self, llm: LLMService) -> None:
         self.llm = llm
 
-    def refine(self, workflow_type: WorkflowType, raw_result: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
+    def refine(
+        self,
+        workflow_type: WorkflowType,
+        raw_result: dict[str, Any],
+        analysis: dict[str, Any],
+    ) -> tuple[dict[str, Any], LLMCall]:
         fallback = self._fallback_content(workflow_type, raw_result)
         prompt = {
             "workflow_type": workflow_type.value,
@@ -296,7 +302,7 @@ class ContentAgent:
             "analysis": analysis,
             "fallback_shape": fallback,
         }
-        return self.llm.generate_json(
+        response = self.llm.generate_json(
             system_prompt=(
                 "你是企业工作流平台中的 Content Agent。"
                 "请根据业务分析结果输出纯 JSON，字段结构尽量贴合 fallback_shape，"
@@ -305,6 +311,7 @@ class ContentAgent:
             user_prompt=json.dumps(prompt, ensure_ascii=False),
             fallback=fallback,
         )
+        return response.payload, response.call
 
     @staticmethod
     def _fallback_content(workflow_type: WorkflowType, raw_result: dict[str, Any]) -> dict[str, Any]:
@@ -342,7 +349,12 @@ class ReviewerAgent:
     def __init__(self, llm: LLMService) -> None:
         self.llm = llm
 
-    def review(self, workflow_type: WorkflowType, raw_result: dict[str, Any], analysis: dict[str, Any]) -> ReviewDecision:
+    def review(
+        self,
+        workflow_type: WorkflowType,
+        raw_result: dict[str, Any],
+        analysis: dict[str, Any],
+    ) -> tuple[ReviewDecision, LLMCall]:
         fallback = self._fallback_review(workflow_type, raw_result)
         prompt = {
             "workflow_type": workflow_type.value,
@@ -351,7 +363,7 @@ class ReviewerAgent:
             "allowed_status": ["completed", "waiting_human"],
             "required_keys": ["status", "needs_human_review", "score", "reasons"],
         }
-        llm_payload = self.llm.generate_json(
+        response = self.llm.generate_json(
             system_prompt=(
                 "你是企业工作流平台中的 Reviewer Agent。"
                 "请输出纯 JSON。status 只能是 completed 或 waiting_human，"
@@ -360,7 +372,7 @@ class ReviewerAgent:
             user_prompt=json.dumps(prompt, ensure_ascii=False),
             fallback=fallback,
         )
-        return ReviewDecision(**self._merge_review(fallback, llm_payload))
+        return ReviewDecision(**self._merge_review(fallback, response.payload)), response.call
 
     @staticmethod
     def _fallback_review(workflow_type: WorkflowType, raw_result: dict[str, Any]) -> dict[str, Any]:
@@ -588,12 +600,13 @@ class WorkflowEngine:
         request = state["request"]
         run = state["run"]
         raw_result = state["raw_result"]
-        analysis = self.analyst.analyze(request.workflow_type, raw_result)
+        analysis, llm_call = self.analyst.analyze(request.workflow_type, raw_result)
         run.touch(status=RunStatus.EXECUTING, current_step="analysis")
         run.add_log(
             "AnalystAgent",
             "已完成结果分析与行动建议整理。"
             + ("（已调用真实模型）" if self.llm.enabled else "（当前为本地回退策略）"),
+            llm_call=llm_call,
         )
         self.repository.save(run)
         return {"run": run, "analysis": analysis}
@@ -603,12 +616,13 @@ class WorkflowEngine:
         run = state["run"]
         raw_result = state["raw_result"]
         analysis = state["analysis"]
-        deliverables = self.content.refine(request.workflow_type, raw_result, analysis)
+        deliverables, llm_call = self.content.refine(request.workflow_type, raw_result, analysis)
         run.touch(status=RunStatus.EXECUTING, current_step="content")
         run.add_log(
             "ContentAgent",
             "已补充业务可直接使用的输出内容。"
             + ("（已调用真实模型）" if self.llm.enabled else "（当前为本地回退策略）"),
+            llm_call=llm_call,
         )
         self.repository.save(run)
         return {"run": run, "deliverables": deliverables}
@@ -618,7 +632,7 @@ class WorkflowEngine:
         run = state["run"]
         raw_result = state["raw_result"]
         analysis = state["analysis"]
-        review = self.reviewer.review(request.workflow_type, raw_result, analysis)
+        review, llm_call = self.reviewer.review(request.workflow_type, raw_result, analysis)
         run.touch(status=RunStatus.REVIEWING, current_step="review")
         run.review = review
         run.result = {
@@ -630,6 +644,7 @@ class WorkflowEngine:
             "ReviewerAgent",
             "已完成质量审核与人工接管判断。"
             + ("（已调用真实模型）" if self.llm.enabled else "（当前为本地回退策略）"),
+            llm_call=llm_call,
         )
         self.repository.save(run)
         return {"run": run, "review": review}

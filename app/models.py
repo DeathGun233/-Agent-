@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def utc_now() -> datetime:
@@ -36,11 +36,26 @@ class ToolCall(BaseModel):
     success: bool = True
 
 
+class LLMCall(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    provider: str = "openai_compatible"
+    model_name: str
+    system_prompt: str
+    user_prompt: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    latency_ms: int = 0
+    used_fallback: bool = False
+    error: str | None = None
+
+
 class WorkflowLog(BaseModel):
     timestamp: datetime = Field(default_factory=utc_now)
     agent: str
     message: str
     tool_call: ToolCall | None = None
+    llm_call: LLMCall | None = None
 
 
 class ReviewDecision(BaseModel):
@@ -81,8 +96,14 @@ class WorkflowRun(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
 
-    def add_log(self, agent: str, message: str, tool_call: ToolCall | None = None) -> None:
-        self.logs.append(WorkflowLog(agent=agent, message=message, tool_call=tool_call))
+    def add_log(
+        self,
+        agent: str,
+        message: str,
+        tool_call: ToolCall | None = None,
+        llm_call: LLMCall | None = None,
+    ) -> None:
+        self.logs.append(WorkflowLog(agent=agent, message=message, tool_call=tool_call, llm_call=llm_call))
         self.updated_at = utc_now()
 
     def touch(self, status: RunStatus | None = None, current_step: str | None = None) -> None:
