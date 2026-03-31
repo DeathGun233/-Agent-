@@ -1,6 +1,6 @@
 # FlowPilot
 
-`FlowPilot` 是一个偏执行型的企业 AI 工作流自动化项目，用来补足“企业级 RAG 知识库搜索”之外的能力面。它不以检索为中心，而以任务拆解、多 Agent 协作、工具调用、人工接管和流程可观测为核心。
+`FlowPilot` 是一个偏执行型的企业 AI 工作流自动化项目，用来补足“企业级 RAG 知识库搜索”之外的能力面。它不以检索为中心，而是以任务拆解、多 Agent 协作、工具调用、人工接管、Prompt 实验和流程可观测为核心。
 
 ## 当前能力
 
@@ -12,16 +12,19 @@
 - 真实模型接入：默认 `qwen3-max`
 - 真实数据库兼容：`SQLite / MySQL`
 - 缓存兼容：`Redis`
-- 多页面工作台：仪表盘、运行历史、审核中心、详情页
+- 多页面工作台：仪表盘、运行历史、审核中心、详情页、模型与 Prompt 对比页
 - 图形化执行时间线
 - 登录态与角色权限：`viewer / operator / reviewer / admin`
 - 数据库用户表与密码哈希认证
 - AI 运行指标：`prompt / model / token / latency`
+- Prompt 版本管理：可切换 Prompt 方案并沉淀到运行记录
+- 多模型 / Prompt 对比页：按组合聚合运行效果
 
 ## 技术栈
 
 - `Python 3.11`
 - `FastAPI`
+- `LangGraph`
 - `SQLAlchemy`
 - `SQLite / MySQL`
 - `Redis`
@@ -36,6 +39,7 @@
 
 - `DASHSCOPE_API_KEY`
 - `OPENAI_API_KEY`
+- `OPEN_AI_KEY`
 - `MODEL_NAME`
 - `MODEL_BASE_URL`
 - `DATABASE_URL`
@@ -46,12 +50,9 @@
 
 其中：
 
-- `FLOWPILOT_USERS_JSON` 用于初始化数据库用户，不再作为运行时内存账号源
+- `FLOWPILOT_USERS_JSON` 用于初始化数据库用户
 - 用户密码会以 `PBKDF2-SHA256` 哈希形式写入数据库
-
-默认模型端点：
-
-- `https://dashscope.aliyuncs.com/compatible-mode/v1`
+- 默认模型端点为 `https://dashscope.aliyuncs.com/compatible-mode/v1`
 
 ## 本地启动
 
@@ -78,7 +79,7 @@ python -m uvicorn app.main:app --reload
 docker compose -f docker-compose.infra.yml up -d
 ```
 
-然后把环境变量切到：
+然后配置环境变量：
 
 ```env
 DATABASE_URL=mysql+pymysql://flowpilot:flowpilot@127.0.0.1:3306/flowpilot
@@ -99,6 +100,7 @@ python -m pytest -q
 - `POST /logout`
 - `GET /dashboard`
 - `GET /runs`
+- `GET /compare`
 - `GET /reviews`
 - `GET /runs/{id}`
 - `GET /api/health`
@@ -110,19 +112,20 @@ python -m pytest -q
 - `GET /api/workflows/{id}`
 - `POST /api/workflows/run`
 - `POST /api/workflows/{id}/review`
+- `GET /api/experiments/catalog`
+- `GET /api/experiments/compare`
 
 ## 项目说明
 
-当前版本重点展示三件事：
+当前版本重点展示这些能力：
 
 - 多工作流、多 Agent 的执行编排
-- 真实模型增强业务分析与审核
-- MySQL + Redis 兼容的工程化持久化方案
-- 工作台从单页升级为多页面后台，补上运行历史、审核中心和详情页
-- 基于角色的登录态与审核权限控制
-- 任务详情页提供图形化执行时间线，方便演示执行轨迹
-- 用户体系已升级为数据库账号表，默认账号仅用于初始化种子数据
-- 详情页已补充 AI 调用指标，能看到模型、Prompt、Token 和耗时
+- 真实模型增强业务分析、内容生成和审核判断
+- MySQL + Redis 兼容的持久化方案
+- 多页面工作台和图形化执行时间线
+- 基于角色的登录态与审核权限
+- AI 调用可观测：Prompt、模型、Token、耗时
+- Prompt 方案管理与多模型 / Prompt 组合对比
 
 ## 文档
 
@@ -133,3 +136,4 @@ python -m pytest -q
 - 第四步升级说明：[docs/第4步-多页面与权限升级.md](./docs/第4步-多页面与权限升级.md)
 - 第五步升级说明：[docs/第5步-数据库认证升级.md](./docs/第5步-数据库认证升级.md)
 - 第六步升级说明：[docs/第6步-AI运行指标升级.md](./docs/第6步-AI运行指标升级.md)
+- 第七步升级说明：[docs/第7步-Prompt版本管理与对比页.md](./docs/第7步-Prompt版本管理与对比页.md)

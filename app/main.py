@@ -1,24 +1,22 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+from statistics import mean
 from urllib.parse import quote
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from app.auth import (
-    ROLE_ADMIN,
-    ROLE_OPERATOR,
-    ROLE_REVIEWER,
-    AuthService,
-    AuthUser,
-)
+from app.auth import ROLE_ADMIN, ROLE_OPERATOR, ROLE_REVIEWER, AuthService, AuthUser
 from app.cache import CacheStore
 from app.config import Settings
 from app.db import Database
 from app.models import ReviewSubmission, WorkflowRequest, WorkflowRun, WorkflowType
+from app.prompt_catalog import DEFAULT_PROMPT_PROFILE_ID, resolve_execution_profile
 from app.repository import WorkflowRepository
 from app.services import WorkflowEngine
 
@@ -29,7 +27,7 @@ settings = Settings.from_env()
 database = Database(settings.database_url)
 cache = CacheStore(settings.redis_url)
 
-app = FastAPI(title="FlowPilot", version="0.3.0")
+app = FastAPI(title="FlowPilot", version="0.4.0")
 repository = WorkflowRepository(database, cache)
 engine = WorkflowEngine(repository, settings)
 auth_service = AuthService(settings, database)
@@ -63,6 +61,46 @@ def _template_response(request: Request, template_name: str, context: dict, stat
 
 def _workflow_titles() -> dict[str, str]:
     return {item["workflow_type"]: item["title"] for item in engine.list_templates()}
+
+
+def _extract_execution_profile(run: WorkflowRun) -> dict[str, str]:
+    payload = run.result.get("execution_profile") if isinstance(run.result, dict) else None
+    if isinstance(payload, dict):
+        prompt_profile = payload.get("prompt_profile") or {}
+        return {
+            "model_name": payload.get("model_name", settings.model_name),
+            "model_label": payload.get("model_label", payload.get("model_name", settings.model_name)),
+            "prompt_profile_id": prompt_profile.get("profile_id", DEFAULT_PROMPT_PROFILE_ID),
+            "prompt_profile_name": prompt_profile.get("name", "平衡版"),
+            "prompt_profile_version": prompt_profile.get("version", "v1"),
+            "prompt_profile_description": prompt_profile.get("description", ""),
+        }
+    llm_logs = [log for log in run.logs if log.llm_call]
+    if llm_logs:
+        llm_call = llm_logs[0].llm_call
+        return {
+            "model_name": llm_call.model_name,
+            "model_label": llm_call.model_name,
+            "prompt_profile_id": llm_call.prompt_profile_id or DEFAULT_PROMPT_PROFILE_ID,
+            "prompt_profile_name": llm_call.prompt_profile_name or "平衡版",
+            "prompt_profile_version": llm_call.prompt_profile_version or "v1",
+            "prompt_profile_description": "",
+        }
+    resolved = resolve_execution_profile(default_model_name=settings.model_name)
+    return {
+        "model_name": resolved.model_name,
+        "model_label": resolved.model_label,
+        "prompt_profile_id": resolved.prompt_profile.profile_id,
+        "prompt_profile_name": resolved.prompt_profile.name,
+        "prompt_profile_version": resolved.prompt_profile.version,
+        "prompt_profile_description": resolved.prompt_profile.description,
+    }
+
+
+def _normalized_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 def _summarize_runs(runs: list[WorkflowRun]) -> dict[str, int]:
@@ -101,20 +139,26 @@ def _build_timeline(run: WorkflowRun) -> list[dict]:
 
 def _build_run_table(runs: list[WorkflowRun]) -> list[dict]:
     titles = _workflow_titles()
-    return [
-        {
-            "id": run.id,
-            "title": titles.get(run.workflow_type.value, run.workflow_type.value),
-            "workflow_type": run.workflow_type.value,
-            "status": run.status.value,
-            "current_step": run.current_step,
-            "objective": run.objective,
-            "review_score": f"{run.review.score:.2f}" if run.review else "--",
-            "updated_at": run.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
-            "created_at": run.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        for run in runs
-    ]
+    rows = []
+    for run in runs:
+        execution_profile = _extract_execution_profile(run)
+        rows.append(
+            {
+                "id": run.id,
+                "title": titles.get(run.workflow_type.value, run.workflow_type.value),
+                "workflow_type": run.workflow_type.value,
+                "status": run.status.value,
+                "current_step": run.current_step,
+                "objective": run.objective,
+                "review_score": f"{run.review.score:.2f}" if run.review else "--",
+                "updated_at": run.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at": run.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                "model_name": execution_profile["model_name"],
+                "prompt_profile_label": f"{execution_profile['prompt_profile_name']} {execution_profile['prompt_profile_version']}",
+                "prompt_profile_id": execution_profile["prompt_profile_id"],
+            }
+        )
+    return rows
 
 
 def _build_llm_summary(run: WorkflowRun) -> dict[str, object]:
@@ -123,6 +167,7 @@ def _build_llm_summary(run: WorkflowRun) -> dict[str, object]:
         return {
             "total_requests": 0,
             "model_names": [],
+            "prompt_profiles": [],
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
@@ -131,15 +176,63 @@ def _build_llm_summary(run: WorkflowRun) -> dict[str, object]:
             "fallback_requests": 0,
         }
     total_latency_ms = sum(call.latency_ms for call in llm_calls)
+    prompt_profiles = sorted(
+        {
+            f"{call.prompt_profile_name or '平衡版'} {call.prompt_profile_version or 'v1'}"
+            for call in llm_calls
+        }
+    )
     return {
         "total_requests": len(llm_calls),
         "model_names": sorted({call.model_name for call in llm_calls}),
+        "prompt_profiles": prompt_profiles,
         "prompt_tokens": sum(call.prompt_tokens for call in llm_calls),
         "completion_tokens": sum(call.completion_tokens for call in llm_calls),
         "total_tokens": sum(call.total_tokens for call in llm_calls),
         "total_latency_ms": total_latency_ms,
         "avg_latency_ms": round(total_latency_ms / len(llm_calls)),
         "fallback_requests": sum(1 for call in llm_calls if call.used_fallback),
+    }
+
+
+def _build_compare_summary(runs: list[WorkflowRun]) -> dict[str, object]:
+    grouped: dict[tuple[str, str, str], list[WorkflowRun]] = defaultdict(list)
+    for run in runs:
+        profile = _extract_execution_profile(run)
+        grouped[(run.workflow_type.value, profile["model_name"], profile["prompt_profile_id"])].append(run)
+
+    titles = _workflow_titles()
+    rows = []
+    for (workflow_type, model_name, prompt_profile_id), group_runs in grouped.items():
+        scores = [run.review.score for run in group_runs if run.review]
+        llm_calls = [log.llm_call for run in group_runs for log in run.logs if log.llm_call]
+        profile = _extract_execution_profile(group_runs[0])
+        waiting_count = sum(1 for run in group_runs if run.status.value == "waiting_human")
+        fallback_count = sum(1 for call in llm_calls if call.used_fallback)
+        rows.append(
+            {
+                "workflow_title": titles.get(workflow_type, workflow_type),
+                "workflow_type": workflow_type,
+                "model_name": model_name,
+                "prompt_profile_id": prompt_profile_id,
+                "prompt_profile_label": f"{profile['prompt_profile_name']} {profile['prompt_profile_version']}",
+                "run_count": len(group_runs),
+                "avg_score": round(mean(scores), 2) if scores else 0.0,
+                "avg_tokens": round(mean(call.total_tokens for call in llm_calls)) if llm_calls else 0,
+                "avg_latency_ms": round(mean(call.latency_ms for call in llm_calls)) if llm_calls else 0,
+                "handoff_rate": round(waiting_count / len(group_runs) * 100, 1) if group_runs else 0.0,
+                "fallback_rate": round(fallback_count / len(llm_calls) * 100, 1) if llm_calls else 0.0,
+                "latest_run_at": max(_normalized_datetime(run.updated_at) for run in group_runs).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+
+    rows.sort(key=lambda item: (-item["run_count"], item["workflow_type"], item["model_name"], item["prompt_profile_id"]))
+    return {
+        "rows": rows,
+        "combination_count": len(rows),
+        "run_count": len(runs),
+        "model_count": len({row["model_name"] for row in rows}),
+        "prompt_count": len({row["prompt_profile_id"] for row in rows}),
     }
 
 
@@ -229,6 +322,10 @@ def dashboard_page(request: Request):
             user,
             "dashboard",
             templates_data=engine.list_templates(),
+            model_options=engine.list_model_options(),
+            prompt_profiles=engine.list_prompt_profiles(),
+            default_model_name=settings.model_name,
+            default_prompt_profile_id=DEFAULT_PROMPT_PROFILE_ID,
             recent_runs=_build_run_table(runs[:6]),
             summary=_summarize_runs(runs),
             review_queue=_build_run_table(queue[:5]),
@@ -242,6 +339,8 @@ def dashboard_run_action(
     request: Request,
     workflow_type: str = Form(...),
     payload_json: str = Form("{}"),
+    selected_model_name: str = Form(settings.model_name, alias="model_name"),
+    prompt_profile_id: str = Form(DEFAULT_PROMPT_PROFILE_ID),
 ) -> RedirectResponse:
     user = _page_user(request, {ROLE_OPERATOR, ROLE_ADMIN})
     if user is None:
@@ -250,7 +349,14 @@ def dashboard_run_action(
         payload = json.loads(payload_json)
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"payload_json is invalid JSON: {exc}") from exc
-    run = engine.run_workflow(WorkflowRequest(workflow_type=WorkflowType(workflow_type), input_payload=payload))
+    run = engine.run_workflow(
+        WorkflowRequest(
+            workflow_type=WorkflowType(workflow_type),
+            input_payload=payload,
+            model_name_override=selected_model_name,
+            prompt_profile_id=prompt_profile_id,
+        )
+    )
     return RedirectResponse(url=f"/runs/{run.id}", status_code=303)
 
 
@@ -269,6 +375,28 @@ def runs_page(request: Request):
             "runs",
             runs=_build_run_table(runs),
             summary=_summarize_runs(runs),
+        ),
+    )
+
+
+@app.get("/compare", response_class=HTMLResponse)
+def compare_page(request: Request):
+    user = _page_user(request)
+    if user is None:
+        return _redirect_to_login(request)
+    runs = engine.list_runs()
+    compare_summary = _build_compare_summary(runs)
+    return _template_response(
+        request,
+        "compare.html",
+        _common_context(
+            request,
+            user,
+            "compare",
+            compare_summary=compare_summary,
+            model_options=engine.list_model_options(),
+            prompt_profiles=engine.list_prompt_profiles(),
+            latest_runs=_build_run_table(runs[:8]),
         ),
     )
 
@@ -299,6 +427,7 @@ def run_detail_page(run_id: str, request: Request):
     run = engine.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="workflow run not found")
+    execution_profile = _extract_execution_profile(run)
     return _template_response(
         request,
         "run_detail.html",
@@ -307,6 +436,8 @@ def run_detail_page(run_id: str, request: Request):
             user,
             "runs",
             run=run,
+            execution_profile=execution_profile,
+            run_result_json=json.dumps(run.result, ensure_ascii=False, indent=2),
             run_view={
                 "title": _workflow_titles().get(run.workflow_type.value, run.workflow_type.value),
                 "timeline": _build_timeline(run),
@@ -370,6 +501,23 @@ def session_info(request: Request) -> dict[str, object]:
 def list_templates(request: Request) -> list[dict]:
     auth_service.require_user(request)
     return engine.list_templates()
+
+
+@app.get("/api/experiments/catalog")
+def experiment_catalog(request: Request) -> dict[str, object]:
+    auth_service.require_user(request)
+    return {
+        "models": engine.list_model_options(),
+        "prompt_profiles": engine.list_prompt_profiles(),
+        "default_model_name": settings.model_name,
+        "default_prompt_profile_id": DEFAULT_PROMPT_PROFILE_ID,
+    }
+
+
+@app.get("/api/experiments/compare")
+def compare_summary(request: Request) -> dict[str, object]:
+    auth_service.require_user(request)
+    return _build_compare_summary(engine.list_runs())
 
 
 @app.get("/api/workflows")

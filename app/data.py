@@ -30,7 +30,7 @@ WORKFLOW_TEMPLATES = [
     WorkflowTemplate(
         workflow_type=WorkflowType.SUPPORT_TRIAGE,
         title="客服工单智能分流",
-        description="工单分类、优先级排序、回复草稿和升级建议。",
+        description="完成工单分类、优先级排序、回复草稿和升级建议。",
         sample_payload={
             "tickets": [
                 {

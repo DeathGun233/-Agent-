@@ -17,6 +17,8 @@
       <div class="badge-row">
         <span class="badge status-waiting_human">waiting_human</span>
         <span class="badge">{{ run.current_step }}</span>
+        <span class="badge">{{ run.model_name }}</span>
+        <span class="badge">{{ run.prompt_profile_label }}</span>
         <span class="badge">评分 {{ run.review_score }}</span>
       </div>
       <form method="post" action="/runs/{{ run.id }}/review/form" style="margin-top: 14px;">

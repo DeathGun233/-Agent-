@@ -11,7 +11,23 @@ from langgraph.graph import END, START, StateGraph
 from app.config import Settings
 from app.data import RISK_CUSTOMERS, SALES_DATA, WORKFLOW_TEMPLATES
 from app.llm import LLMService
-from app.models import LLMCall, ReviewDecision, RunStatus, ToolCall, WorkflowPlan, WorkflowRequest, WorkflowRun, WorkflowType
+from app.models import (
+    ExecutionProfile,
+    LLMCall,
+    ReviewDecision,
+    RunStatus,
+    ToolCall,
+    WorkflowPlan,
+    WorkflowRequest,
+    WorkflowRun,
+    WorkflowType,
+)
+from app.prompt_catalog import (
+    get_prompt_definition,
+    list_model_options,
+    list_prompt_profiles,
+    resolve_execution_profile,
+)
 from app.repository import WorkflowRepository
 
 
@@ -26,6 +42,7 @@ WORKFLOW_TITLES = {
 class WorkflowState(TypedDict, total=False):
     request: WorkflowRequest
     run: WorkflowRun
+    execution_profile: ExecutionProfile
     raw_result: dict[str, Any]
     analysis: dict[str, Any]
     deliverables: dict[str, Any]
@@ -38,24 +55,24 @@ class PlannerAgent:
         step_map = {
             WorkflowType.SALES_FOLLOWUP: [
                 "解析分析范围和关注指标",
-                "调用销售分析工具生成漏斗与风险客户",
-                "提炼异常原因并生成跟进计划",
+                "调用销售分析工具生成漏斗和风险客户",
+                "提炼异常原因并生成跟进建议",
                 "执行质量审核与人工接管判断",
             ],
             WorkflowType.MARKETING_CAMPAIGN: [
-                "解析产品、受众和渠道要求",
+                "解析产品、受众和渠道需求",
                 "调用内容工厂工具生成多渠道内容资产",
                 "补充投放建议和 A/B 版本",
                 "执行品牌与合规审核",
             ],
             WorkflowType.SUPPORT_TRIAGE: [
-                "读取工单并进行优先级判断",
-                "调用分流工具完成分类与回复草稿",
+                "读取工单并完成优先级判断",
+                "调用分流工具完成分类和回复草稿",
                 "识别高风险工单并安排升级",
                 "执行人工接管判断",
             ],
             WorkflowType.MEETING_MINUTES: [
-                "解析会议纪要与决策信息",
+                "解析会议纪要和决策信息",
                 "调用行动项提取工具整理负责人和截止时间",
                 "生成会后总结与待办清单",
                 "执行完整性审核",
@@ -186,7 +203,7 @@ class ToolCenter:
 
     def extract_meeting_actions(self, payload: dict[str, Any]) -> dict[str, Any]:
         notes = payload.get("notes", "")
-        segments = [segment.strip(" ；;。.") for segment in re.split(r"[；;\n]+", notes) if segment.strip()]
+        segments = [segment.strip(" ；。") for segment in re.split(r"[；\n]+", notes) if segment.strip()]
         actions = []
         for segment in segments:
             match = re.search(
@@ -214,8 +231,14 @@ class AnalystAgent:
     def __init__(self, llm: LLMService) -> None:
         self.llm = llm
 
-    def analyze(self, workflow_type: WorkflowType, raw_result: dict[str, Any]) -> tuple[dict[str, Any], LLMCall]:
+    def analyze(
+        self,
+        workflow_type: WorkflowType,
+        raw_result: dict[str, Any],
+        execution_profile: ExecutionProfile,
+    ) -> tuple[dict[str, Any], LLMCall]:
         fallback = self._fallback_analysis(workflow_type, raw_result)
+        prompt_definition = get_prompt_definition(execution_profile.prompt_profile.profile_id)
         prompt = {
             "workflow_type": workflow_type.value,
             "raw_result": raw_result,
@@ -224,11 +247,14 @@ class AnalystAgent:
         response = self.llm.generate_json(
             system_prompt=(
                 "你是企业工作流平台中的 Analyst Agent。"
-                "请根据输入数据输出纯 JSON，必须包含 insights 和 action_plan 两个数组，"
-                "每个数组至少 2 条，用简洁专业的中文表达，不要输出 markdown。"
+                "请根据输入数据输出纯 JSON，必须包含 insights 和 action_plan 两个数组。"
+                "每个数组至少 2 条，使用简洁专业的中文表达，不要输出 markdown。"
+                f"当前 Prompt 方案：{execution_profile.prompt_profile.name} {execution_profile.prompt_profile.version}。"
+                f"{prompt_definition.analyst_instruction}"
             ),
             user_prompt=json.dumps(prompt, ensure_ascii=False),
             fallback=fallback,
+            execution_profile=execution_profile,
         )
         return response.payload, response.call
 
@@ -240,12 +266,12 @@ class AnalystAgent:
                 "insights": [
                     f"当前线索转化率为 {summary['conversion_rate']:.1%}，低于稳态目标。",
                     f"资格转化率为 {summary['qualification_rate']:.1%}，说明筛选阶段仍有优化空间。",
-                    f"平均销售周期 {summary['avg_cycle_days']} 天，需优先缩短中后段推进时长。",
+                    f"平均销售周期 {summary['avg_cycle_days']} 天，需要优先缩短中后段推进时长。",
                 ],
                 "action_plan": [
                     "针对高风险客户安排 24 小时内跟进。",
                     "对转化偏低销售补一轮演示复盘与异议处理脚本。",
-                    "按行业整理 ROI 物料，推动预算审批场景。",
+                    "按行业整理 ROI 材料，推动预算审批场景。",
                 ],
             }
         if workflow_type == WorkflowType.SUPPORT_TRIAGE:
@@ -294,8 +320,10 @@ class ContentAgent:
         workflow_type: WorkflowType,
         raw_result: dict[str, Any],
         analysis: dict[str, Any],
+        execution_profile: ExecutionProfile,
     ) -> tuple[dict[str, Any], LLMCall]:
         fallback = self._fallback_content(workflow_type, raw_result)
+        prompt_definition = get_prompt_definition(execution_profile.prompt_profile.profile_id)
         prompt = {
             "workflow_type": workflow_type.value,
             "raw_result": raw_result,
@@ -305,11 +333,14 @@ class ContentAgent:
         response = self.llm.generate_json(
             system_prompt=(
                 "你是企业工作流平台中的 Content Agent。"
-                "请根据业务分析结果输出纯 JSON，字段结构尽量贴合 fallback_shape，"
+                "请根据业务分析结果输出纯 JSON，字段结构尽量贴合 fallback_shape。"
                 "内容必须是中文，便于业务同学直接使用。"
+                f"当前 Prompt 方案：{execution_profile.prompt_profile.name} {execution_profile.prompt_profile.version}。"
+                f"{prompt_definition.content_instruction}"
             ),
             user_prompt=json.dumps(prompt, ensure_ascii=False),
             fallback=fallback,
+            execution_profile=execution_profile,
         )
         return response.payload, response.call
 
@@ -330,21 +361,8 @@ class ContentAgent:
 
 
 class ReviewerAgent:
-    AUTO_EXECUTE_HINTS = (
-        "可直接流转执行",
-        "可直接执行",
-        "结果结构完整",
-        "自动完成",
-    )
-    MANUAL_REVIEW_HINTS = (
-        "人工",
-        "复核",
-        "确认",
-        "升级",
-        "待确认",
-        "风险",
-        "合规",
-    )
+    AUTO_EXECUTE_HINTS = ("可直接流转执行", "可直接执行", "结果结构完整", "自动完成")
+    MANUAL_REVIEW_HINTS = ("人工", "复核", "确认", "升级", "待确认", "风险", "合规")
 
     def __init__(self, llm: LLMService) -> None:
         self.llm = llm
@@ -354,8 +372,10 @@ class ReviewerAgent:
         workflow_type: WorkflowType,
         raw_result: dict[str, Any],
         analysis: dict[str, Any],
+        execution_profile: ExecutionProfile,
     ) -> tuple[ReviewDecision, LLMCall]:
         fallback = self._fallback_review(workflow_type, raw_result)
+        prompt_definition = get_prompt_definition(execution_profile.prompt_profile.profile_id)
         prompt = {
             "workflow_type": workflow_type.value,
             "raw_result": raw_result,
@@ -366,11 +386,14 @@ class ReviewerAgent:
         response = self.llm.generate_json(
             system_prompt=(
                 "你是企业工作流平台中的 Reviewer Agent。"
-                "请输出纯 JSON。status 只能是 completed 或 waiting_human，"
+                "请输出纯 JSON。status 只能是 completed 或 waiting_human。"
                 "score 取值 0 到 1，reasons 是中文数组。"
+                f"当前 Prompt 方案：{execution_profile.prompt_profile.name} {execution_profile.prompt_profile.version}。"
+                f"{prompt_definition.reviewer_instruction}"
             ),
             user_prompt=json.dumps(prompt, ensure_ascii=False),
             fallback=fallback,
+            execution_profile=execution_profile,
         )
         return ReviewDecision(**self._merge_review(fallback, response.payload)), response.call
 
@@ -471,6 +494,12 @@ class WorkflowEngine:
     def list_templates(self) -> list[dict[str, Any]]:
         return [template.model_dump(mode="json") for template in WORKFLOW_TEMPLATES]
 
+    def list_model_options(self) -> list[dict[str, str]]:
+        return list_model_options()
+
+    def list_prompt_profiles(self) -> list[dict[str, str]]:
+        return list_prompt_profiles()
+
     def list_runs(self) -> list[WorkflowRun]:
         return self.repository.list_all()
 
@@ -512,9 +541,18 @@ class WorkflowEngine:
         return run
 
     def run_workflow(self, request: WorkflowRequest) -> WorkflowRun:
-        run = WorkflowRun(workflow_type=request.workflow_type, input_payload=request.input_payload)
+        execution_profile = resolve_execution_profile(
+            default_model_name=self.settings.model_name,
+            model_name_override=request.model_name_override,
+            prompt_profile_id=request.prompt_profile_id,
+        )
+        run = WorkflowRun(
+            workflow_type=request.workflow_type,
+            input_payload=request.input_payload,
+            result={"execution_profile": execution_profile.model_dump(mode="json")},
+        )
         self.repository.save(run)
-        final_state = self.graph.invoke({"request": request, "run": run})
+        final_state = self.graph.invoke({"request": request, "run": run, "execution_profile": execution_profile})
         final_run = final_state["run"]
         self.repository.save(final_run)
         return final_run
@@ -575,11 +613,15 @@ class WorkflowEngine:
     def _planner_node(self, state: WorkflowState) -> WorkflowState:
         request = state["request"]
         run = state["run"]
+        execution_profile = state["execution_profile"]
         run.touch(status=RunStatus.PLANNING, current_step="planning")
         plan = self.planner.build_plan(request)
         run.plan = plan
         run.objective = plan.objective
-        run.add_log("PlannerAgent", f"已生成执行计划，共 {len(plan.steps)} 步。")
+        run.add_log(
+            "PlannerAgent",
+            f"已生成执行计划，共 {len(plan.steps)} 步。模型：{execution_profile.model_name}；Prompt：{execution_profile.prompt_profile.name} {execution_profile.prompt_profile.version}。",
+        )
         self.repository.save(run)
         return {"run": run}
 
@@ -600,7 +642,8 @@ class WorkflowEngine:
         request = state["request"]
         run = state["run"]
         raw_result = state["raw_result"]
-        analysis, llm_call = self.analyst.analyze(request.workflow_type, raw_result)
+        execution_profile = state["execution_profile"]
+        analysis, llm_call = self.analyst.analyze(request.workflow_type, raw_result, execution_profile)
         run.touch(status=RunStatus.EXECUTING, current_step="analysis")
         run.add_log(
             "AnalystAgent",
@@ -616,7 +659,8 @@ class WorkflowEngine:
         run = state["run"]
         raw_result = state["raw_result"]
         analysis = state["analysis"]
-        deliverables, llm_call = self.content.refine(request.workflow_type, raw_result, analysis)
+        execution_profile = state["execution_profile"]
+        deliverables, llm_call = self.content.refine(request.workflow_type, raw_result, analysis, execution_profile)
         run.touch(status=RunStatus.EXECUTING, current_step="content")
         run.add_log(
             "ContentAgent",
@@ -632,10 +676,12 @@ class WorkflowEngine:
         run = state["run"]
         raw_result = state["raw_result"]
         analysis = state["analysis"]
-        review, llm_call = self.reviewer.review(request.workflow_type, raw_result, analysis)
+        execution_profile = state["execution_profile"]
+        review, llm_call = self.reviewer.review(request.workflow_type, raw_result, analysis, execution_profile)
         run.touch(status=RunStatus.REVIEWING, current_step="review")
         run.review = review
         run.result = {
+            "execution_profile": execution_profile.model_dump(mode="json"),
             "raw_result": raw_result,
             "analysis": analysis,
             "deliverables": state["deliverables"],

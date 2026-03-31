@@ -8,7 +8,7 @@ from typing import Any
 from openai import OpenAI
 
 from app.config import Settings
-from app.models import LLMCall
+from app.models import ExecutionProfile, LLMCall
 
 
 @dataclass(frozen=True)
@@ -34,11 +34,15 @@ class LLMService:
         system_prompt: str,
         user_prompt: str,
         fallback: dict[str, Any],
+        execution_profile: ExecutionProfile | None = None,
     ) -> LLMJsonResponse:
+        model_name = execution_profile.model_name if execution_profile else self.settings.model_name
         if not self._client:
             return LLMJsonResponse(
                 payload=fallback,
                 call=self._build_call_trace(
+                    model_name=model_name,
+                    execution_profile=execution_profile,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     latency_ms=0,
@@ -50,7 +54,7 @@ class LLMService:
         started_at = time.perf_counter()
         try:
             response = self._client.chat.completions.create(
-                model=self.settings.model_name,
+                model=model_name,
                 temperature=0.2,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -62,6 +66,8 @@ class LLMService:
             parsed = self._extract_json(content)
             usage = getattr(response, "usage", None)
             call = self._build_call_trace(
+                model_name=model_name,
+                execution_profile=execution_profile,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 latency_ms=latency_ms,
@@ -77,6 +83,8 @@ class LLMService:
             return LLMJsonResponse(
                 payload=fallback,
                 call=self._build_call_trace(
+                    model_name=model_name,
+                    execution_profile=execution_profile,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     latency_ms=latency_ms,
@@ -88,6 +96,8 @@ class LLMService:
     def _build_call_trace(
         self,
         *,
+        model_name: str,
+        execution_profile: ExecutionProfile | None,
         system_prompt: str,
         user_prompt: str,
         latency_ms: int,
@@ -99,7 +109,10 @@ class LLMService:
     ) -> LLMCall:
         return LLMCall(
             provider="dashscope_openai_compatible",
-            model_name=self.settings.model_name,
+            model_name=model_name,
+            prompt_profile_id=execution_profile.prompt_profile.profile_id if execution_profile else None,
+            prompt_profile_name=execution_profile.prompt_profile.name if execution_profile else None,
+            prompt_profile_version=execution_profile.prompt_profile.version if execution_profile else None,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             prompt_tokens=prompt_tokens,

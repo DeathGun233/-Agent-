@@ -7,6 +7,8 @@
   <div class="badge-row">
     <span class="badge status-{{ run.status.value }}">{{ run.status.value }}</span>
     <span class="badge">{{ run.current_step }}</span>
+    <span class="badge">{{ execution_profile.model_name }}</span>
+    <span class="badge">{{ execution_profile.prompt_profile_name }} {{ execution_profile.prompt_profile_version }}</span>
     {% if run.review %}
     <span class="badge">评分 {{ "%.2f"|format(run.review.score) }}</span>
     {% endif %}
@@ -26,6 +28,23 @@
   <div class="metric">
     <strong>{{ llm_summary.avg_latency_ms }} ms</strong>
     <span class="muted">平均耗时</span>
+  </div>
+</section>
+
+<section class="panel">
+  <h3>执行配置</h3>
+  <div class="grid two">
+    <div class="compare-highlight">
+      <strong>模型</strong>
+      <p class="muted">{{ execution_profile.model_name }}</p>
+    </div>
+    <div class="compare-highlight">
+      <strong>Prompt 方案</strong>
+      <p class="muted">{{ execution_profile.prompt_profile_name }} {{ execution_profile.prompt_profile_version }}</p>
+      {% if execution_profile.prompt_profile_description %}
+      <p class="muted">{{ execution_profile.prompt_profile_description }}</p>
+      {% endif %}
+    </div>
   </div>
 </section>
 
@@ -92,6 +111,9 @@
       {% for model_name in llm_summary.model_names %}
       <span class="badge">{{ model_name }}</span>
       {% endfor %}
+      {% for prompt_label in llm_summary.prompt_profiles %}
+      <span class="badge">{{ prompt_label }}</span>
+      {% endfor %}
       <span class="badge">Prompt Tokens {{ llm_summary.prompt_tokens }}</span>
       <span class="badge">Completion Tokens {{ llm_summary.completion_tokens }}</span>
       <span class="badge">Fallback {{ llm_summary.fallback_requests }}</span>
@@ -106,6 +128,7 @@
         <strong>{{ log.agent }}</strong>
         <div class="meta-row">
           <span class="badge">{{ log.llm_call.model_name }}</span>
+          <span class="badge">{{ log.llm_call.prompt_profile_name }} {{ log.llm_call.prompt_profile_version }}</span>
           <span class="badge">{{ log.llm_call.total_tokens }} tokens</span>
           <span class="badge">{{ log.llm_call.latency_ms }} ms</span>
           {% if log.llm_call.used_fallback %}
@@ -151,6 +174,7 @@
           {% endif %}
           {% if log.llm_call %}
           <span class="badge">{{ log.llm_call.model_name }}</span>
+          <span class="badge">{{ log.llm_call.prompt_profile_name }} {{ log.llm_call.prompt_profile_version }}</span>
           {% endif %}
         </div>
       </div>
@@ -183,6 +207,6 @@
 
 <section class="panel">
   <h3>结果 JSON</h3>
-  <pre>{{ run.result | tojson(indent=2) }}</pre>
+  <pre>{{ run_result_json }}</pre>
 </section>
 {% endblock %}

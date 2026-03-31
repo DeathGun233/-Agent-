@@ -18,6 +18,8 @@
       --warn-soft: #f7e8d6;
       --danger: #b33b2e;
       --danger-soft: #f8ddd7;
+      --info: #39539c;
+      --info-soft: #e8eefc;
       --shadow: 0 16px 36px rgba(32, 24, 17, 0.09);
     }
     * { box-sizing: border-box; }
@@ -180,7 +182,7 @@
     .badge.status-completed { background: var(--accent-soft); color: var(--accent); }
     .badge.status-waiting_human { background: var(--warn-soft); color: var(--warn); }
     .badge.status-failed { background: var(--danger-soft); color: var(--danger); }
-    .badge.status-reviewing { background: #e8eefc; color: #39539c; }
+    .badge.status-reviewing { background: var(--info-soft); color: var(--info); }
     .table-wrap {
       overflow: auto;
       border: 1px solid var(--line);
@@ -262,6 +264,8 @@
       overflow: auto;
       font-size: 13px;
       line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
     }
     .timeline-shell {
       position: relative;
@@ -320,6 +324,12 @@
       color: var(--muted);
       background: rgba(255, 255, 255, 0.48);
     }
+    .compare-highlight {
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: linear-gradient(135deg, rgba(17, 97, 73, 0.09), rgba(255, 255, 255, 0.86));
+    }
     @media (max-width: 1080px) {
       .layout, .split, .grid.two, .grid.three {
         grid-template-columns: 1fr;
@@ -349,7 +359,7 @@
     <aside class="sidebar">
       <div class="brand">
         <h1>FlowPilot</h1>
-        <p>多 Agent 企业流程工作台，聚焦执行编排、人工审核和可观测轨迹。</p>
+        <p>多 Agent 企业流程工作台，聚焦执行编排、Prompt 实验、多模型对比、人工审核和可观测执行轨迹。</p>
       </div>
       <div class="user-card">
         <strong>{{ current_user.display_name }}</strong>
@@ -358,6 +368,7 @@
       <nav class="nav">
         <a href="/dashboard" class="{% if active_page == 'dashboard' %}active{% endif %}">仪表盘</a>
         <a href="/runs" class="{% if active_page == 'runs' %}active{% endif %}">运行历史</a>
+        <a href="/compare" class="{% if active_page == 'compare' %}active{% endif %}">模型与 Prompt 对比</a>
         {% if capabilities.can_review %}
         <a href="/reviews" class="{% if active_page == 'reviews' %}active{% endif %}">审核中心</a>
         {% endif %}

@@ -3,7 +3,7 @@
 {% block content %}
 <section class="hero">
   <h2>多 Agent 工作台</h2>
-  <p>从这里发起新流程、查看当前积压、快速跳转到审核队列或最近任务。现在页面已经从单页 Demo 拆成独立工作区，演示时更接近真实后台。</p>
+  <p>从这里发起新工作流、查看当前积压，并直接为同一业务场景切换不同模型和 Prompt 方案，方便后续做效果对比。</p>
 </section>
 
 <section class="grid three">
@@ -25,6 +25,38 @@
           {% endfor %}
         </select>
       </label>
+      <div class="grid two">
+        <label>
+          模型选择
+          <select name="model_name" id="model_name">
+            {% for model in model_options %}
+            <option value="{{ model.model_name }}" {% if model.model_name == default_model_name %}selected{% endif %}>
+              {{ model.label }} · {{ model.model_name }}
+            </option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Prompt 方案
+          <select name="prompt_profile_id" id="prompt_profile_id">
+            {% for prompt in prompt_profiles %}
+            <option value="{{ prompt.profile_id }}" {% if prompt.profile_id == default_prompt_profile_id %}selected{% endif %}>
+              {{ prompt.name }} {{ prompt.version }}
+            </option>
+            {% endfor %}
+          </select>
+        </label>
+      </div>
+      <div class="grid two">
+        <div class="compare-highlight" id="model_hint">
+          <strong>模型说明</strong>
+          <p class="muted" id="model_hint_text">{{ model_options[0].description }}</p>
+        </div>
+        <div class="compare-highlight" id="prompt_hint">
+          <strong>Prompt 说明</strong>
+          <p class="muted" id="prompt_hint_text">{{ prompt_profiles[0].description }}</p>
+        </div>
+      </div>
       <label>
         输入 JSON
         <textarea id="payload_json" name="payload_json">{{ templates_data[0].sample_payload | tojson(indent=2) }}</textarea>
@@ -35,6 +67,7 @@
     <div class="empty">当前账号只有查看权限，不能发起新任务。</div>
     {% endif %}
   </div>
+
   <div class="panel">
     <h3>模板中心</h3>
     <div class="card-list">
@@ -73,6 +106,8 @@
         <div class="badge-row">
           <span class="badge status-{{ run.status }}">{{ run.status }}</span>
           <span class="badge">{{ run.current_step }}</span>
+          <span class="badge">{{ run.model_name }}</span>
+          <span class="badge">{{ run.prompt_profile_label }}</span>
           <span class="badge">评分 {{ run.review_score }}</span>
         </div>
       </article>
@@ -82,39 +117,49 @@
     <div class="empty">还没有运行记录，先从左侧创建一个工作流。</div>
     {% endif %}
   </div>
+
   <div class="panel">
-    <h3>系统拓扑</h3>
+    <h3>系统拓扑与实验入口</h3>
     <div class="badge-row">
       {% for node in graph.nodes %}
       <span class="badge">{{ node }}</span>
       {% endfor %}
     </div>
-    <p>当前运行时：{{ graph.runtime }}，入口节点：{{ graph.entrypoint }}。详情页会展示每次执行的图形化时间线。</p>
+    <p>当前运行时：{{ graph.runtime }}，入口节点：{{ graph.entrypoint }}。如果你要比较 Prompt 和模型效果，直接去“模型与 Prompt 对比”页查看聚合指标。</p>
+    <a class="button-link secondary" href="/compare">打开对比页</a>
     {% if capabilities.can_review %}
       {% if review_queue %}
-      <div class="card-list">
+      <div class="card-list" style="margin-top: 14px;">
         {% for run in review_queue %}
         <article class="item-card">
           <h4><a href="/runs/{{ run.id }}">{{ run.title }}</a></h4>
           <p class="muted">等待审核，当前步骤：{{ run.current_step }}</p>
           <div class="badge-row">
             <span class="badge status-waiting_human">waiting_human</span>
+            <span class="badge">{{ run.model_name }}</span>
+            <span class="badge">{{ run.prompt_profile_label }}</span>
             <a class="button-link secondary" href="/reviews">前往审核中心</a>
           </div>
         </article>
         {% endfor %}
       </div>
       {% else %}
-      <div class="empty">当前没有待审核任务。</div>
+      <div class="empty" style="margin-top: 14px;">当前没有待审核任务。</div>
       {% endif %}
     {% endif %}
   </div>
 </section>
 {% endblock %}
+
 {% block scripts %}
 <script>
   const workflowType = document.getElementById("workflow_type");
   const payloadEditor = document.getElementById("payload_json");
+  const modelSelect = document.getElementById("model_name");
+  const promptSelect = document.getElementById("prompt_profile_id");
+  const modelHintText = document.getElementById("model_hint_text");
+  const promptHintText = document.getElementById("prompt_hint_text");
+
   const templateMap = new Map();
   document.querySelectorAll(".use-template").forEach((button) => {
     templateMap.set(button.dataset.type, button.dataset.payload);
@@ -124,10 +169,32 @@
       payloadEditor.focus();
     });
   });
+
+  const modelHints = new Map([
+    {% for model in model_options %}
+    ["{{ model.model_name }}", "{{ model.description }}"],
+    {% endfor %}
+  ]);
+
+  const promptHints = new Map([
+    {% for prompt in prompt_profiles %}
+    ["{{ prompt.profile_id }}", "{{ prompt.description }}"],
+    {% endfor %}
+  ]);
+
+  function refreshHints() {
+    modelHintText.textContent = modelHints.get(modelSelect.value) || "";
+    promptHintText.textContent = promptHints.get(promptSelect.value) || "";
+  }
+
   workflowType?.addEventListener("change", () => {
     if (templateMap.has(workflowType.value)) {
       payloadEditor.value = JSON.stringify(JSON.parse(templateMap.get(workflowType.value)), null, 2);
     }
   });
+
+  modelSelect?.addEventListener("change", refreshHints);
+  promptSelect?.addEventListener("change", refreshHints);
+  refreshHints();
 </script>
 {% endblock %}

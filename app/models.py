@@ -40,6 +40,9 @@ class LLMCall(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
     provider: str = "openai_compatible"
     model_name: str
+    prompt_profile_id: str | None = None
+    prompt_profile_name: str | None = None
+    prompt_profile_version: str | None = None
     system_prompt: str
     user_prompt: str
     prompt_tokens: int = 0
@@ -66,8 +69,25 @@ class ReviewDecision(BaseModel):
 
 
 class WorkflowRequest(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
     workflow_type: WorkflowType
     input_payload: dict[str, Any] = Field(default_factory=dict)
+    model_name_override: str | None = None
+    prompt_profile_id: str | None = None
+
+
+class PromptProfileRef(BaseModel):
+    profile_id: str
+    name: str
+    version: str
+    description: str
+
+
+class ExecutionProfile(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+    model_name: str
+    model_label: str
+    prompt_profile: PromptProfileRef
 
 
 class ReviewSubmission(BaseModel):

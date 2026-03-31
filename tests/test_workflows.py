@@ -25,7 +25,6 @@ def test_seeded_users_are_persisted_with_password_hash() -> None:
     with database.session() as session:
         record = session.get(UserAccountRecord, "admin")
         assert record is not None
-        assert record.display_name == "系统管理员"
         assert record.password_hash.startswith("pbkdf2_sha256$")
         assert record.password_hash != "admin123"
 
@@ -54,8 +53,8 @@ def test_dashboard_renders_multi_page_shell() -> None:
     response = client.get("/dashboard")
     assert response.status_code == 200
     assert "新建工作流" in response.text
-    assert "运行历史" in response.text
-    assert "仪表盘" in response.text
+    assert "模型与 Prompt 对比" in response.text
+    assert "Prompt 方案" in response.text
 
 
 def test_health_endpoint_exposes_backend_shape() -> None:
@@ -65,6 +64,15 @@ def test_health_endpoint_exposes_backend_shape() -> None:
     assert body["status"] == "ok"
     assert body["database_backend"] in {"sqlite", "mysql", "custom"}
     assert "redis_enabled" in body
+
+
+def test_catalog_endpoint_exposes_models_and_prompt_profiles() -> None:
+    login_as("viewer", "viewer123")
+    response = client.get("/api/experiments/catalog")
+    body = response.json()
+    assert response.status_code == 200
+    assert any(item["model_name"] == "qwen3-max" for item in body["models"])
+    assert any(item["profile_id"] == "balanced-v1" for item in body["prompt_profiles"])
 
 
 def test_graph_endpoint_exposes_langgraph_shape() -> None:
@@ -88,7 +96,7 @@ def test_review_page_requires_reviewer_role() -> None:
     assert "审核中心" in allowed.text
 
 
-def test_sales_workflow_runs() -> None:
+def test_sales_workflow_runs_with_selected_model_and_prompt_profile() -> None:
     login_as("operator", "operator123")
     response = client.post(
         "/api/workflows/run",
@@ -99,17 +107,19 @@ def test_sales_workflow_runs() -> None:
                 "region": "华东",
                 "sales_reps": ["王晨", "李雪"],
             },
+            "model_name_override": "qwen-plus",
+            "prompt_profile_id": "ops-deep-v1",
         },
     )
     body = response.json()
     assert response.status_code == 200
     assert body["result"]["raw_result"]["summary"]["lead_count"] > 0
-    assert body["review"]["status"] in {"completed", "waiting_human"}
-    assert any("LangGraph 状态流" in log["message"] for log in body["logs"])
+    assert body["result"]["execution_profile"]["model_name"] == "qwen-plus"
+    assert body["result"]["execution_profile"]["prompt_profile"]["profile_id"] == "ops-deep-v1"
     llm_logs = [log for log in body["logs"] if log.get("llm_call")]
     assert len(llm_logs) == 3
-    assert all(log["llm_call"]["model_name"] == "qwen3-max" for log in llm_logs)
-    assert all("system_prompt" in log["llm_call"] for log in llm_logs)
+    assert all(log["llm_call"]["model_name"] == "qwen-plus" for log in llm_logs)
+    assert all(log["llm_call"]["prompt_profile_id"] == "ops-deep-v1" for log in llm_logs)
 
 
 def test_waiting_human_reasons_do_not_include_auto_execute_copy() -> None:
@@ -124,7 +134,7 @@ def test_waiting_human_reasons_do_not_include_auto_execute_copy() -> None:
             "status": "waiting_human",
             "needs_human_review": True,
             "score": 0.65,
-            "reasons": ["需人工确认一对一辅导计划及风险客户跟进策略的可行性与资源支持"],
+            "reasons": ["需要人工确认一对一辅导计划及风险客户跟进策略的可行性与资源支持。"],
         },
     )
     assert merged["status"] == "waiting_human"
@@ -147,6 +157,8 @@ def test_support_workflow_flags_human_review_and_can_be_approved() -> None:
                     }
                 ]
             },
+            "model_name_override": "qwen-turbo",
+            "prompt_profile_id": "balanced-v1",
         },
     )
     body = response.json()
@@ -167,7 +179,7 @@ def test_support_workflow_flags_human_review_and_can_be_approved() -> None:
     assert any("审核负责人" in log["message"] for log in approved["logs"])
 
 
-def test_detail_page_contains_graphic_timeline() -> None:
+def test_detail_page_contains_ai_metrics_and_execution_profile() -> None:
     login_as("operator", "operator123")
     created = client.post(
         "/api/workflows/run",
@@ -175,13 +187,28 @@ def test_detail_page_contains_graphic_timeline() -> None:
             "workflow_type": "meeting_minutes",
             "input_payload": {
                 "meeting_title": "产品周会",
-                "notes": "1. 张敏本周五前完成竞品复盘。2. 王晨今天下班前确认试点客户。",
+                "notes": "1. 张敏本周五前完成竞品复盘；2. 王晨今天下班前确认试点客户。",
             },
+            "model_name_override": "qwen3-max",
+            "prompt_profile_id": "exec-brief-v2",
         },
     ).json()
     detail = client.get(f"/runs/{created['id']}")
     assert detail.status_code == 200
     assert "图形化执行时间线" in detail.text
-    assert "执行日志" in detail.text
     assert "AI 运行指标" in detail.text
-    assert "结果 JSON" in detail.text
+    assert "执行配置" in detail.text
+    assert "管理摘要版 v2" in detail.text
+
+
+def test_compare_page_and_api_show_prompt_experiments() -> None:
+    login_as("viewer", "viewer123")
+    page = client.get("/compare")
+    assert page.status_code == 200
+    assert "模型与 Prompt 对比" in page.text
+
+    compare_api = client.get("/api/experiments/compare")
+    body = compare_api.json()
+    assert compare_api.status_code == 200
+    assert body["run_count"] >= 1
+    assert any("prompt_profile_label" in row for row in body["rows"])

@@ -3,7 +3,7 @@
 {% block content %}
 <section class="hero">
   <h2>运行历史</h2>
-  <p>这里按任务维度展示所有流程实例，适合回看执行结果、人工干预情况和各阶段状态。</p>
+  <p>这里按任务维度展示所有工作流实例。除了状态和审核结果，你也可以看到每次运行绑定的模型和 Prompt 方案，方便后续回看实验效果。</p>
 </section>
 
 <section class="grid three">
@@ -21,6 +21,8 @@
         <tr>
           <th>任务</th>
           <th>状态</th>
+          <th>模型</th>
+          <th>Prompt 方案</th>
           <th>当前步骤</th>
           <th>更新时间</th>
           <th>评分</th>
@@ -35,6 +37,8 @@
             <div class="muted">{{ run.id }}</div>
           </td>
           <td><span class="badge status-{{ run.status }}">{{ run.status }}</span></td>
+          <td>{{ run.model_name }}</td>
+          <td>{{ run.prompt_profile_label }}</td>
           <td>{{ run.current_step }}</td>
           <td>{{ run.updated_at }}</td>
           <td>{{ run.review_score }}</td>

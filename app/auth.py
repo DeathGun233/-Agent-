@@ -83,9 +83,7 @@ class AuthService:
         return AuthUser(username=record.username, display_name=record.display_name, role=record.role)
 
     def build_session_cookie(self, user: AuthUser) -> str:
-        payload = {
-            "username": user.username,
-        }
+        payload = {"username": user.username}
         encoded = base64.urlsafe_b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
         signature = hmac.new(
             self.settings.secret_key.encode("utf-8"),
