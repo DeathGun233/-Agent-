@@ -36,13 +36,40 @@ class ToolCall(BaseModel):
     success: bool = True
 
 
+class PromptProfileRef(BaseModel):
+    profile_id: str
+    name: str
+    version: str
+    description: str
+
+
+class RoutingPolicyRef(BaseModel):
+    policy_id: str
+    name: str
+    description: str
+
+
+class ExecutionProfile(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    primary_model_name: str
+    primary_model_label: str
+    prompt_profile: PromptProfileRef
+    routing_policy: RoutingPolicyRef
+    model_routes: dict[str, str] = Field(default_factory=dict)
+
+
 class LLMCall(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
+
     provider: str = "openai_compatible"
     model_name: str
+    route_target: str
     prompt_profile_id: str | None = None
     prompt_profile_name: str | None = None
     prompt_profile_version: str | None = None
+    routing_policy_id: str | None = None
+    routing_policy_name: str | None = None
     system_prompt: str
     user_prompt: str
     prompt_tokens: int = 0
@@ -70,24 +97,13 @@ class ReviewDecision(BaseModel):
 
 class WorkflowRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
+
     workflow_type: WorkflowType
     input_payload: dict[str, Any] = Field(default_factory=dict)
     model_name_override: str | None = None
     prompt_profile_id: str | None = None
-
-
-class PromptProfileRef(BaseModel):
-    profile_id: str
-    name: str
-    version: str
-    description: str
-
-
-class ExecutionProfile(BaseModel):
-    model_config = ConfigDict(protected_namespaces=())
-    model_name: str
-    model_label: str
-    prompt_profile: PromptProfileRef
+    routing_policy_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReviewSubmission(BaseModel):
@@ -139,3 +155,49 @@ class WorkflowTemplate(BaseModel):
     title: str
     description: str
     sample_payload: dict[str, Any]
+
+
+class PromptProfile(BaseModel):
+    profile_id: str
+    base_profile_id: str | None = None
+    name: str
+    version: str
+    description: str
+    analyst_instruction: str
+    content_instruction: str
+    reviewer_instruction: str
+    is_builtin: bool = False
+    is_active: bool = True
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+    def as_ref(self) -> PromptProfileRef:
+        return PromptProfileRef(
+            profile_id=self.profile_id,
+            name=self.name,
+            version=self.version,
+            description=self.description,
+        )
+
+
+class PromptProfileForm(BaseModel):
+    profile_id: str
+    base_profile_id: str | None = None
+    name: str
+    version: str
+    description: str
+    analyst_instruction: str
+    content_instruction: str
+    reviewer_instruction: str
+
+
+class EvaluationRun(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    dataset_id: str
+    dataset_name: str
+    candidate_profile: ExecutionProfile
+    baseline_profile: ExecutionProfile
+    summary: dict[str, Any] = Field(default_factory=dict)
+    case_results: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)

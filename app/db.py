@@ -50,6 +50,46 @@ class UserAccountRecord(Base):
     )
 
 
+class PromptProfileRecord(Base):
+    __tablename__ = "prompt_profiles"
+
+    profile_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    base_profile_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    analyst_instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    content_instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    reviewer_instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class EvaluationRunRecord(Base):
+    __tablename__ = "evaluation_runs"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    dataset_id: Mapped[str] = mapped_column(Text, nullable=False)
+    dataset_name: Mapped[str] = mapped_column(Text, nullable=False)
+    candidate_profile_json: Mapped[str] = mapped_column(Text, nullable=False)
+    baseline_profile_json: Mapped[str] = mapped_column(Text, nullable=False)
+    summary_json: Mapped[str] = mapped_column(Text, nullable=False)
+    case_results_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class Database:
     def __init__(self, database_url: str) -> None:
         connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}

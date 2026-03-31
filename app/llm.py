@@ -31,16 +31,18 @@ class LLMService:
     def generate_json(
         self,
         *,
+        route_target: str,
         system_prompt: str,
         user_prompt: str,
         fallback: dict[str, Any],
-        execution_profile: ExecutionProfile | None = None,
+        execution_profile: ExecutionProfile,
     ) -> LLMJsonResponse:
-        model_name = execution_profile.model_name if execution_profile else self.settings.model_name
+        model_name = execution_profile.model_routes.get(route_target, execution_profile.primary_model_name)
         if not self._client:
             return LLMJsonResponse(
                 payload=fallback,
                 call=self._build_call_trace(
+                    route_target=route_target,
                     model_name=model_name,
                     execution_profile=execution_profile,
                     system_prompt=system_prompt,
@@ -66,6 +68,7 @@ class LLMService:
             parsed = self._extract_json(content)
             usage = getattr(response, "usage", None)
             call = self._build_call_trace(
+                route_target=route_target,
                 model_name=model_name,
                 execution_profile=execution_profile,
                 system_prompt=system_prompt,
@@ -83,6 +86,7 @@ class LLMService:
             return LLMJsonResponse(
                 payload=fallback,
                 call=self._build_call_trace(
+                    route_target=route_target,
                     model_name=model_name,
                     execution_profile=execution_profile,
                     system_prompt=system_prompt,
@@ -96,8 +100,9 @@ class LLMService:
     def _build_call_trace(
         self,
         *,
+        route_target: str,
         model_name: str,
-        execution_profile: ExecutionProfile | None,
+        execution_profile: ExecutionProfile,
         system_prompt: str,
         user_prompt: str,
         latency_ms: int,
@@ -110,9 +115,12 @@ class LLMService:
         return LLMCall(
             provider="dashscope_openai_compatible",
             model_name=model_name,
-            prompt_profile_id=execution_profile.prompt_profile.profile_id if execution_profile else None,
-            prompt_profile_name=execution_profile.prompt_profile.name if execution_profile else None,
-            prompt_profile_version=execution_profile.prompt_profile.version if execution_profile else None,
+            route_target=route_target,
+            prompt_profile_id=execution_profile.prompt_profile.profile_id,
+            prompt_profile_name=execution_profile.prompt_profile.name,
+            prompt_profile_version=execution_profile.prompt_profile.version,
+            routing_policy_id=execution_profile.routing_policy.policy_id,
+            routing_policy_name=execution_profile.routing_policy.name,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             prompt_tokens=prompt_tokens,

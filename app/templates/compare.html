@@ -3,13 +3,13 @@
 {% block content %}
 <section class="hero">
   <h2>模型与 Prompt 对比</h2>
-  <p>这个页面把每次运行的模型选择和 Prompt 版本沉淀下来，按“工作流 + 模型 + Prompt 方案”做聚合，方便你展示 AI 应用开发里的实验和优化能力。</p>
+  <p>这里会把每次运行沉淀下来的模型、Prompt 版本和路由策略聚合起来，便于展示 AI 应用工程里的实验、对比和优化能力。</p>
 </section>
 
 <section class="grid three">
   <div class="metric"><strong>{{ compare_summary.run_count }}</strong><span class="muted">纳入对比的运行数</span></div>
   <div class="metric"><strong>{{ compare_summary.model_count }}</strong><span class="muted">模型种类</span></div>
-  <div class="metric"><strong>{{ compare_summary.prompt_count }}</strong><span class="muted">Prompt 方案数</span></div>
+  <div class="metric"><strong>{{ compare_summary.routing_count }}</strong><span class="muted">路由策略数</span></div>
 </section>
 
 <section class="split">
@@ -19,23 +19,26 @@
       {% for model in model_options %}
       <article class="item-card">
         <h4>{{ model.label }}</h4>
-        <div class="badge-row">
-          <span class="badge">{{ model.model_name }}</span>
-        </div>
+        <div class="badge-row"><span class="badge">{{ model.model_name }}</span></div>
         <p class="muted">{{ model.description }}</p>
       </article>
       {% endfor %}
     </div>
   </div>
   <div class="panel">
-    <h3>Prompt 方案</h3>
+    <h3>路由与 Prompt 方案</h3>
     <div class="card-list">
+      {% for item in routing_policies %}
+      <article class="item-card">
+        <h4>{{ item.name }}</h4>
+        <div class="badge-row"><span class="badge">{{ item.policy_id }}</span></div>
+        <p class="muted">{{ item.description }}</p>
+      </article>
+      {% endfor %}
       {% for prompt in prompt_profiles %}
       <article class="item-card">
         <h4>{{ prompt.name }} {{ prompt.version }}</h4>
-        <div class="badge-row">
-          <span class="badge">{{ prompt.profile_id }}</span>
-        </div>
+        <div class="badge-row"><span class="badge">{{ prompt.profile_id }}</span></div>
         <p class="muted">{{ prompt.description }}</p>
       </article>
       {% endfor %}
@@ -53,6 +56,7 @@
           <th>工作流</th>
           <th>模型</th>
           <th>Prompt</th>
+          <th>路由策略</th>
           <th>运行次数</th>
           <th>平均评分</th>
           <th>平均 Tokens</th>
@@ -68,6 +72,7 @@
           <td>{{ row.workflow_title }}</td>
           <td>{{ row.model_name }}</td>
           <td>{{ row.prompt_profile_label }}</td>
+          <td>{{ row.routing_policy_name }}</td>
           <td>{{ row.run_count }}</td>
           <td>{{ "%.2f"|format(row.avg_score) }}</td>
           <td>{{ row.avg_tokens }}</td>
@@ -81,7 +86,7 @@
     </table>
   </div>
   {% else %}
-  <div class="empty">当前还没有足够的运行记录可供对比。先去仪表盘跑几组不同模型或 Prompt 方案。</div>
+  <div class="empty">当前还没有足够的运行记录可供对比。先去仪表盘跑几组不同模型、Prompt 或路由策略试试。</div>
   {% endif %}
 </section>
 
@@ -96,6 +101,7 @@
         <span class="badge status-{{ run.status }}">{{ run.status }}</span>
         <span class="badge">{{ run.model_name }}</span>
         <span class="badge">{{ run.prompt_profile_label }}</span>
+        <span class="badge">{{ run.routing_policy_name }}</span>
         <span class="badge">评分 {{ run.review_score }}</span>
       </div>
       <p class="muted">{{ run.updated_at }}</p>

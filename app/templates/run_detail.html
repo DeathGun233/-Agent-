@@ -3,156 +3,112 @@
 {% block content %}
 <section class="hero">
   <h2>{{ run_view.title }}</h2>
-  <p>{{ run.objective or "当前任务还没有写入目标描述。" }}</p>
+  <p>{{ run.objective }}</p>
   <div class="badge-row">
     <span class="badge status-{{ run.status.value }}">{{ run.status.value }}</span>
     <span class="badge">{{ run.current_step }}</span>
-    <span class="badge">{{ execution_profile.model_name }}</span>
-    <span class="badge">{{ execution_profile.prompt_profile_name }} {{ execution_profile.prompt_profile_version }}</span>
-    {% if run.review %}
-    <span class="badge">评分 {{ "%.2f"|format(run.review.score) }}</span>
-    {% endif %}
-    <span class="badge">创建于 {{ run_view.created_at }}</span>
-  </div>
-</section>
-
-<section class="grid three">
-  <div class="metric">
-    <strong>{{ llm_summary.total_requests }}</strong>
-    <span class="muted">AI 调用次数</span>
-  </div>
-  <div class="metric">
-    <strong>{{ llm_summary.total_tokens }}</strong>
-    <span class="muted">累计 Tokens</span>
-  </div>
-  <div class="metric">
-    <strong>{{ llm_summary.avg_latency_ms }} ms</strong>
-    <span class="muted">平均耗时</span>
-  </div>
-</section>
-
-<section class="panel">
-  <h3>执行配置</h3>
-  <div class="grid two">
-    <div class="compare-highlight">
-      <strong>模型</strong>
-      <p class="muted">{{ execution_profile.model_name }}</p>
-    </div>
-    <div class="compare-highlight">
-      <strong>Prompt 方案</strong>
-      <p class="muted">{{ execution_profile.prompt_profile_name }} {{ execution_profile.prompt_profile_version }}</p>
-      {% if execution_profile.prompt_profile_description %}
-      <p class="muted">{{ execution_profile.prompt_profile_description }}</p>
-      {% endif %}
-    </div>
+    <span class="badge">{{ run_view.created_at }}</span>
   </div>
 </section>
 
 <section class="panel">
   <h3>图形化执行时间线</h3>
-  {% if run_view.timeline %}
   <div class="timeline-shell">
     <div class="timeline-line"></div>
-    {% for node in run_view.timeline %}
-    <div class="timeline-node" style="left: {{ node.left }}%;">
+    {% for point in run_view.timeline %}
+    <div class="timeline-node" style="left: {{ point.left }}%;">
       <div class="timeline-dot"></div>
       <div class="timeline-card">
-        <strong>{{ node.agent }}</strong>
-        <div>{{ node.message }}</div>
-        <span>{{ node.timestamp }} · 持续 {{ node.duration }}</span>
-        {% if node.tool_name %}
-        <div class="meta-row"><span class="badge">{{ node.tool_name }}</span></div>
+        <strong>{{ point.agent }}</strong>
+        <div>{{ point.message }}</div>
+        <span>{{ point.timestamp }} / 耗时 {{ point.duration }}</span>
+        {% if point.tool_name %}
+        <div class="badge-row"><span class="badge">{{ point.tool_name }}</span></div>
         {% endif %}
       </div>
     </div>
     {% endfor %}
   </div>
-  {% else %}
-  <div class="empty">当前没有执行日志，还无法生成时间线。</div>
-  {% endif %}
+</section>
+
+<section class="grid three">
+  <div class="metric"><strong>{{ llm_summary.total_requests }}</strong><span class="muted">AI 调用次数</span></div>
+  <div class="metric"><strong>{{ llm_summary.total_tokens }}</strong><span class="muted">累计 Tokens</span></div>
+  <div class="metric"><strong>{{ llm_summary.avg_latency_ms }}</strong><span class="muted">平均耗时 ms</span></div>
 </section>
 
 <section class="split">
   <div class="panel">
-    <h3>审核与决策</h3>
-    {% if run.review %}
-    <div class="badge-row">
-      <span class="badge status-{{ run.review.status.value }}">{{ run.review.status.value }}</span>
-      <span class="badge">needs_human_review={{ run.review.needs_human_review }}</span>
-      <span class="badge">score={{ "%.2f"|format(run.review.score) }}</span>
+    <h3>AI 运行指标</h3>
+    <div class="compact-grid">
+      <div class="compare-highlight"><strong>模型</strong><p class="muted">{{ llm_summary.model_names | join(" / ") or "暂无" }}</p></div>
+      <div class="compare-highlight"><strong>路由目标</strong><p class="muted">{{ llm_summary.route_targets | join(" / ") or "暂无" }}</p></div>
+      <div class="compare-highlight"><strong>Prompt 版本</strong><p class="muted">{{ llm_summary.prompt_profiles | join(" / ") or "暂无" }}</p></div>
+      <div class="compare-highlight"><strong>路由策略</strong><p class="muted">{{ llm_summary.routing_policies | join(" / ") or "暂无" }}</p></div>
     </div>
-    <div class="card-list" style="margin-top: 12px;">
-      {% for reason in run.review.reasons %}
-      <div class="item-card">{{ reason }}</div>
+    <div class="card-list" style="margin-top: 14px;">
+      {% for log in run.logs %}
+        {% if log.llm_call %}
+        <article class="item-card">
+          <h4>{{ log.agent }}</h4>
+          <div class="badge-row">
+            <span class="badge">{{ log.llm_call.model_name }}</span>
+            <span class="badge">{{ log.llm_call.route_target }}</span>
+            <span class="badge">{{ log.llm_call.prompt_profile_name }} {{ log.llm_call.prompt_profile_version }}</span>
+            <span class="badge">{{ log.llm_call.routing_policy_name }}</span>
+            <span class="badge">{{ log.llm_call.total_tokens }} tokens</span>
+            <span class="badge">{{ log.llm_call.latency_ms }} ms</span>
+            {% if log.llm_call.used_fallback %}
+            <span class="badge status-failed">fallback</span>
+            {% endif %}
+          </div>
+          <p class="muted">System Prompt：{{ log.llm_call.system_prompt }}</p>
+          <p class="muted">User Prompt：{{ log.llm_call.user_prompt }}</p>
+        </article>
+        {% endif %}
       {% endfor %}
     </div>
-    {% else %}
-    <div class="empty">当前还没有审核结果。</div>
-    {% endif %}
-
-    {% if capabilities.can_review and run.status.value == "waiting_human" %}
-    <form method="post" action="/runs/{{ run.id }}/review/form" style="margin-top: 16px;">
-      <input type="hidden" name="next_page" value="detail" />
-      <label>
-        人工审核备注
-        <textarea name="comment" placeholder="输入人工判断和处理说明"></textarea>
-      </label>
-      <div class="badge-row">
-        <button type="submit" name="decision" value="approve">审核通过</button>
-        <button type="submit" name="decision" value="reject" class="danger">驳回任务</button>
-      </div>
-    </form>
-    {% endif %}
   </div>
 
   <div class="panel">
-    <h3>AI 运行指标</h3>
-    <div class="badge-row">
-      {% for model_name in llm_summary.model_names %}
-      <span class="badge">{{ model_name }}</span>
-      {% endfor %}
-      {% for prompt_label in llm_summary.prompt_profiles %}
-      <span class="badge">{{ prompt_label }}</span>
-      {% endfor %}
-      <span class="badge">Prompt Tokens {{ llm_summary.prompt_tokens }}</span>
-      <span class="badge">Completion Tokens {{ llm_summary.completion_tokens }}</span>
-      <span class="badge">Fallback {{ llm_summary.fallback_requests }}</span>
-    </div>
-    {% if llm_summary.total_requests == 0 %}
-    <div class="empty" style="margin-top: 12px;">当前任务没有触发模型调用。</div>
-    {% else %}
-    <div class="card-list" style="margin-top: 12px;">
-      {% for log in run.logs %}
-      {% if log.llm_call %}
+    <h3>执行配置</h3>
+    <div class="card-list">
       <article class="item-card">
-        <strong>{{ log.agent }}</strong>
-        <div class="meta-row">
-          <span class="badge">{{ log.llm_call.model_name }}</span>
-          <span class="badge">{{ log.llm_call.prompt_profile_name }} {{ log.llm_call.prompt_profile_version }}</span>
-          <span class="badge">{{ log.llm_call.total_tokens }} tokens</span>
-          <span class="badge">{{ log.llm_call.latency_ms }} ms</span>
-          {% if log.llm_call.used_fallback %}
-          <span class="badge status-waiting_human">fallback</span>
-          {% endif %}
-        </div>
-        <div class="meta-row">
-          <span class="badge">prompt {{ log.llm_call.prompt_tokens }}</span>
-          <span class="badge">completion {{ log.llm_call.completion_tokens }}</span>
-        </div>
-        {% if log.llm_call.error %}
-        <p class="muted">回退原因：{{ log.llm_call.error }}</p>
-        {% endif %}
-        <label>
-          System Prompt
-          <textarea readonly>{{ log.llm_call.system_prompt }}</textarea>
-        </label>
-        <label>
-          User Prompt
-          <textarea readonly>{{ log.llm_call.user_prompt }}</textarea>
-        </label>
+        <h4>{{ execution_profile.primary_model_label }}</h4>
+        <div class="badge-row"><span class="badge">{{ execution_profile.primary_model_name }}</span></div>
       </article>
+      <article class="item-card">
+        <h4>{{ execution_profile.prompt_profile_name }} {{ execution_profile.prompt_profile_version }}</h4>
+        <p class="muted">{{ execution_profile.prompt_profile_description }}</p>
+      </article>
+      <article class="item-card">
+        <h4>{{ execution_profile.routing_policy_name }}</h4>
+        <p class="muted">{{ execution_profile.routing_policy_description }}</p>
+      </article>
+    </div>
+    {% if run.review %}
+    <div class="panel" style="margin-top: 14px; padding: 16px;">
+      <h3>审核与决策</h3>
+      <div class="badge-row">
+        <span class="badge status-{{ run.review.status.value }}">{{ run.review.status.value }}</span>
+        <span class="badge">needs_human_review={{ run.review.needs_human_review }}</span>
+        <span class="badge">score={{ "%.2f"|format(run.review.score) }}</span>
+      </div>
+      <div class="card-list" style="margin-top: 12px;">
+        {% for reason in run.review.reasons %}
+        <article class="item-card">{{ reason }}</article>
+        {% endfor %}
+      </div>
+      {% if capabilities.can_review and run.status.value == "waiting_human" %}
+      <form method="post" action="/runs/{{ run.id }}/review/form" style="margin-top: 14px;">
+        <input type="hidden" name="next_page" value="detail" />
+        <label>人工审核备注<textarea name="comment" placeholder="输入人工判断和处理说明"></textarea></label>
+        <div class="badge-row">
+          <button type="submit" name="decision" value="approve">审核通过</button>
+          <button type="submit" name="decision" value="reject" class="danger">驳回任务</button>
+        </div>
+      </form>
       {% endif %}
-      {% endfor %}
     </div>
     {% endif %}
   </div>
@@ -161,52 +117,24 @@
 <section class="split">
   <div class="panel">
     <h3>执行日志</h3>
-    {% if run.logs %}
     <div class="card-list">
       {% for log in run.logs %}
-      <div class="item-card">
-        <strong>{{ log.agent }}</strong>
-        <div>{{ log.message }}</div>
-        <div class="meta-row">
+      <article class="item-card">
+        <h4>{{ log.agent }}</h4>
+        <p>{{ log.message }}</p>
+        <div class="badge-row">
           <span class="badge">{{ log.timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S") }}</span>
           {% if log.tool_call %}
           <span class="badge">{{ log.tool_call.name }}</span>
           {% endif %}
-          {% if log.llm_call %}
-          <span class="badge">{{ log.llm_call.model_name }}</span>
-          <span class="badge">{{ log.llm_call.prompt_profile_name }} {{ log.llm_call.prompt_profile_version }}</span>
-          {% endif %}
         </div>
-      </div>
+      </article>
       {% endfor %}
     </div>
-    {% else %}
-    <div class="empty">当前没有日志。</div>
-    {% endif %}
   </div>
-
   <div class="panel">
-    <h3>流程图节点</h3>
-    <div class="badge-row">
-      {% for node in graph.nodes %}
-      <span class="badge">{{ node }}</span>
-      {% endfor %}
-    </div>
-    <div class="card-list" style="margin-top: 12px;">
-      {% for edge in graph.edges %}
-      <div class="item-card">
-        <strong>{{ edge.from }} → {{ edge.to }}</strong>
-        {% if edge.condition %}
-        <div class="muted">{{ edge.condition }}</div>
-        {% endif %}
-      </div>
-      {% endfor %}
-    </div>
+    <h3>结果 JSON</h3>
+    <pre>{{ run_result_json }}</pre>
   </div>
-</section>
-
-<section class="panel">
-  <h3>结果 JSON</h3>
-  <pre>{{ run_result_json }}</pre>
 </section>
 {% endblock %}

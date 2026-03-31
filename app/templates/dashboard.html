@@ -3,7 +3,7 @@
 {% block content %}
 <section class="hero">
   <h2>多 Agent 工作台</h2>
-  <p>从这里发起新工作流、查看当前积压，并直接为同一业务场景切换不同模型和 Prompt 方案，方便后续做效果对比。</p>
+  <p>从这里发起新工作流、切换模型与 Prompt 版本、选择多模型路由策略，并查看最近运行与待审核任务。</p>
 </section>
 
 <section class="grid three">
@@ -27,11 +27,11 @@
       </label>
       <div class="grid two">
         <label>
-          模型选择
+          主模型
           <select name="model_name" id="model_name">
             {% for model in model_options %}
             <option value="{{ model.model_name }}" {% if model.model_name == default_model_name %}selected{% endif %}>
-              {{ model.label }} · {{ model.model_name }}
+              {{ model.label }} / {{ model.model_name }}
             </option>
             {% endfor %}
           </select>
@@ -47,14 +47,28 @@
           </select>
         </label>
       </div>
-      <div class="grid two">
-        <div class="compare-highlight" id="model_hint">
+      <label>
+        多模型路由
+        <select name="routing_policy_id" id="routing_policy_id">
+          {% for item in routing_policies %}
+          <option value="{{ item.policy_id }}" {% if item.policy_id == default_routing_policy_id %}selected{% endif %}>
+            {{ item.name }}
+          </option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="grid three">
+        <div class="compare-highlight">
           <strong>模型说明</strong>
           <p class="muted" id="model_hint_text">{{ model_options[0].description }}</p>
         </div>
-        <div class="compare-highlight" id="prompt_hint">
+        <div class="compare-highlight">
           <strong>Prompt 说明</strong>
           <p class="muted" id="prompt_hint_text">{{ prompt_profiles[0].description }}</p>
+        </div>
+        <div class="compare-highlight">
+          <strong>路由说明</strong>
+          <p class="muted" id="routing_hint_text">{{ routing_policies[0].description }}</p>
         </div>
       </div>
       <label>
@@ -108,25 +122,29 @@
           <span class="badge">{{ run.current_step }}</span>
           <span class="badge">{{ run.model_name }}</span>
           <span class="badge">{{ run.prompt_profile_label }}</span>
+          <span class="badge">{{ run.routing_policy_name }}</span>
           <span class="badge">评分 {{ run.review_score }}</span>
         </div>
       </article>
       {% endfor %}
     </div>
     {% else %}
-    <div class="empty">还没有运行记录，先从左侧创建一个工作流。</div>
+    <div class="empty">还没有运行记录，先创建一个工作流试试。</div>
     {% endif %}
   </div>
 
   <div class="panel">
-    <h3>系统拓扑与实验入口</h3>
+    <h3>流程拓扑与实验入口</h3>
     <div class="badge-row">
       {% for node in graph.nodes %}
       <span class="badge">{{ node }}</span>
       {% endfor %}
     </div>
-    <p>当前运行时：{{ graph.runtime }}，入口节点：{{ graph.entrypoint }}。如果你要比较 Prompt 和模型效果，直接去“模型与 Prompt 对比”页查看聚合指标。</p>
-    <a class="button-link secondary" href="/compare">打开对比页</a>
+    <p>当前工作流运行时为 {{ graph.runtime }}，入口节点是 {{ graph.entrypoint }}。如果你想比较 Prompt 与多模型路由效果，可以直接进入“模型与 Prompt 对比”和“自动评测”页面查看指标。</p>
+    <div class="badge-row">
+      <a class="button-link secondary" href="/compare">打开对比页</a>
+      <a class="button-link secondary" href="/evaluations">打开评测页</a>
+    </div>
     {% if capabilities.can_review %}
       {% if review_queue %}
       <div class="card-list" style="margin-top: 14px;">
@@ -138,6 +156,7 @@
             <span class="badge status-waiting_human">waiting_human</span>
             <span class="badge">{{ run.model_name }}</span>
             <span class="badge">{{ run.prompt_profile_label }}</span>
+            <span class="badge">{{ run.routing_policy_name }}</span>
             <a class="button-link secondary" href="/reviews">前往审核中心</a>
           </div>
         </article>
@@ -157,8 +176,10 @@
   const payloadEditor = document.getElementById("payload_json");
   const modelSelect = document.getElementById("model_name");
   const promptSelect = document.getElementById("prompt_profile_id");
+  const routingSelect = document.getElementById("routing_policy_id");
   const modelHintText = document.getElementById("model_hint_text");
   const promptHintText = document.getElementById("prompt_hint_text");
+  const routingHintText = document.getElementById("routing_hint_text");
 
   const templateMap = new Map();
   document.querySelectorAll(".use-template").forEach((button) => {
@@ -182,9 +203,16 @@
     {% endfor %}
   ]);
 
+  const routingHints = new Map([
+    {% for item in routing_policies %}
+    ["{{ item.policy_id }}", "{{ item.description }}"],
+    {% endfor %}
+  ]);
+
   function refreshHints() {
     modelHintText.textContent = modelHints.get(modelSelect.value) || "";
     promptHintText.textContent = promptHints.get(promptSelect.value) || "";
+    routingHintText.textContent = routingHints.get(routingSelect.value) || "";
   }
 
   workflowType?.addEventListener("change", () => {
@@ -195,6 +223,7 @@
 
   modelSelect?.addEventListener("change", refreshHints);
   promptSelect?.addEventListener("change", refreshHints);
+  routingSelect?.addEventListener("change", refreshHints);
   refreshHints();
 </script>
 {% endblock %}

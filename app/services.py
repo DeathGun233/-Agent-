@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections import Counter
+from datetime import datetime, timezone
 from statistics import mean
 from typing import Any, TypedDict
 
@@ -12,8 +12,10 @@ from app.config import Settings
 from app.data import RISK_CUSTOMERS, SALES_DATA, WORKFLOW_TEMPLATES
 from app.llm import LLMService
 from app.models import (
+    EvaluationRun,
     ExecutionProfile,
-    LLMCall,
+    PromptProfile,
+    PromptProfileForm,
     ReviewDecision,
     RunStatus,
     ToolCall,
@@ -23,473 +25,521 @@ from app.models import (
     WorkflowType,
 )
 from app.prompt_catalog import (
-    get_prompt_definition,
+    BUILTIN_PROMPT_PROFILES,
+    DEFAULT_PROMPT_PROFILE_ID,
+    DEFAULT_ROUTING_POLICY_ID,
+    get_evaluation_dataset,
+    list_evaluation_datasets,
     list_model_options,
-    list_prompt_profiles,
+    list_routing_policies,
     resolve_execution_profile,
 )
 from app.repository import WorkflowRepository
 
 
-WORKFLOW_TITLES = {
-    WorkflowType.SALES_FOLLOWUP: "销售分析与跟进计划",
-    WorkflowType.MARKETING_CAMPAIGN: "营销内容工厂",
-    WorkflowType.SUPPORT_TRIAGE: "客服工单智能分流",
-    WorkflowType.MEETING_MINUTES: "会议纪要转执行系统",
-}
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class WorkflowState(TypedDict, total=False):
-    request: WorkflowRequest
     run: WorkflowRun
+    request: WorkflowRequest
     execution_profile: ExecutionProfile
+    prompt_profile: PromptProfile
     raw_result: dict[str, Any]
     analysis: dict[str, Any]
     deliverables: dict[str, Any]
-    review: ReviewDecision
+    review: dict[str, Any]
+    persist: bool
+
+
+class PromptProfileService:
+    def __init__(self, repository: WorkflowRepository) -> None:
+        self.repository = repository
+        self.repository.ensure_prompt_profiles(list(BUILTIN_PROMPT_PROFILES))
+
+    def list_profiles(self, include_inactive: bool = False) -> list[PromptProfile]:
+        return self.repository.list_prompt_profiles(include_inactive=include_inactive)
+
+    def get_profile(self, profile_id: str | None) -> PromptProfile:
+        resolved = self.repository.get_prompt_profile(profile_id or DEFAULT_PROMPT_PROFILE_ID)
+        if resolved is None:
+            fallback = self.repository.get_prompt_profile(DEFAULT_PROMPT_PROFILE_ID)
+            if fallback is None:
+                raise ValueError("prompt profile not found")
+            return fallback
+        return resolved
+
+    def create_profile(self, form: PromptProfileForm) -> PromptProfile:
+        if self.repository.get_prompt_profile(form.profile_id):
+            raise ValueError("prompt profile id already exists")
+        profile = PromptProfile(
+            profile_id=form.profile_id,
+            base_profile_id=form.base_profile_id,
+            name=form.name,
+            version=form.version,
+            description=form.description,
+            analyst_instruction=form.analyst_instruction,
+            content_instruction=form.content_instruction,
+            reviewer_instruction=form.reviewer_instruction,
+            is_builtin=False,
+            is_active=True,
+        )
+        return self.repository.save_prompt_profile(profile)
+
+    def update_profile(self, profile_id: str, form: PromptProfileForm) -> PromptProfile:
+        existing = self.repository.get_prompt_profile(profile_id)
+        if existing is None:
+            raise ValueError("prompt profile not found")
+        if existing.is_builtin:
+            raise ValueError("builtin prompt profile cannot be edited directly, please create a new version")
+        existing.base_profile_id = form.base_profile_id
+        existing.name = form.name
+        existing.version = form.version
+        existing.description = form.description
+        existing.analyst_instruction = form.analyst_instruction
+        existing.content_instruction = form.content_instruction
+        existing.reviewer_instruction = form.reviewer_instruction
+        existing.updated_at = utc_now()
+        return self.repository.save_prompt_profile(existing)
 
 
 class PlannerAgent:
-    def build_plan(self, request: WorkflowRequest) -> WorkflowPlan:
-        objective = WORKFLOW_TITLES[request.workflow_type]
-        step_map = {
+    def plan(self, request: WorkflowRequest) -> WorkflowPlan:
+        title = self._workflow_title(request.workflow_type)
+        objective = self._objective(request.workflow_type, request.input_payload)
+        steps = {
             WorkflowType.SALES_FOLLOWUP: [
-                "解析分析范围和关注指标",
-                "调用销售分析工具生成漏斗和风险客户",
-                "提炼异常原因并生成跟进建议",
-                "执行质量审核与人工接管判断",
+                "读取销售数据并聚合转化漏斗",
+                "识别高风险客户和周期瓶颈",
+                "整理跟进动作与资源建议",
+                "给出是否需要人工确认的判断",
             ],
             WorkflowType.MARKETING_CAMPAIGN: [
-                "解析产品、受众和渠道需求",
-                "调用内容工厂工具生成多渠道内容资产",
-                "补充投放建议和 A/B 版本",
-                "执行品牌与合规审核",
+                "梳理目标产品、受众和渠道",
+                "生成渠道内容和投放建议",
+                "补充合规提示与复用素材",
+                "判断是否需要人工审核后发布",
             ],
             WorkflowType.SUPPORT_TRIAGE: [
-                "读取工单并完成优先级判断",
-                "调用分流工具完成分类和回复草稿",
-                "识别高风险工单并安排升级",
-                "执行人工接管判断",
+                "解析工单内容并分类优先级",
+                "生成回复草稿和升级建议",
+                "识别高风险或上线故障类工单",
+                "判断是否需要人工接管",
             ],
             WorkflowType.MEETING_MINUTES: [
-                "解析会议纪要和决策信息",
-                "调用行动项提取工具整理负责人和截止时间",
-                "生成会后总结与待办清单",
-                "执行完整性审核",
+                "抽取会议待办、负责人和截止时间",
+                "整理会后同步摘要",
+                "补充执行提醒和风险项",
+                "判断是否可直接流转",
             ],
-        }
+        }[request.workflow_type]
         expected_outputs = {
-            WorkflowType.SALES_FOLLOWUP: ["漏斗分析", "风险客户", "跟进建议", "日报摘要"],
-            WorkflowType.MARKETING_CAMPAIGN: ["多渠道文案", "投放建议", "A/B 版本", "审核结论"],
-            WorkflowType.SUPPORT_TRIAGE: ["工单分类", "优先级", "回复草稿", "升级建议"],
-            WorkflowType.MEETING_MINUTES: ["行动项列表", "负责人", "截止时间", "会后邮件"],
-        }
+            WorkflowType.SALES_FOLLOWUP: ["分析结论", "跟进计划", "经理备注"],
+            WorkflowType.MARKETING_CAMPAIGN: ["渠道文案", "投放建议", "审核提示"],
+            WorkflowType.SUPPORT_TRIAGE: ["工单分类", "回复草稿", "升级决策"],
+            WorkflowType.MEETING_MINUTES: ["行动项", "负责人分配", "会后摘要"],
+        }[request.workflow_type]
         return WorkflowPlan(
             workflow_type=request.workflow_type,
-            objective=objective,
-            steps=step_map[request.workflow_type],
-            expected_outputs=expected_outputs[request.workflow_type],
+            objective=f"{title}：{objective}",
+            steps=steps,
+            expected_outputs=expected_outputs,
         )
+
+    @staticmethod
+    def _workflow_title(workflow_type: WorkflowType) -> str:
+        for template in WORKFLOW_TEMPLATES:
+            if template.workflow_type == workflow_type:
+                return template.title
+        return workflow_type.value
+
+    @staticmethod
+    def _objective(workflow_type: WorkflowType, payload: dict[str, Any]) -> str:
+        if workflow_type == WorkflowType.SALES_FOLLOWUP:
+            return f"分析 {payload.get('period', '当前周期')} {payload.get('region', '全区域')} 销售表现并输出跟进计划"
+        if workflow_type == WorkflowType.MARKETING_CAMPAIGN:
+            return f"为 {payload.get('product_name', '目标产品')} 生成多渠道营销内容"
+        if workflow_type == WorkflowType.SUPPORT_TRIAGE:
+            return f"处理 {len(payload.get('tickets', []))} 条客服工单并判断是否升级"
+        return f"整理《{payload.get('meeting_title', '会议')}》纪要并落成执行项"
 
 
 class ToolCenter:
-    def analyze_sales(self, payload: dict[str, Any]) -> dict[str, Any]:
-        reps = set(payload.get("sales_reps") or [])
-        filtered = [row for row in SALES_DATA if not reps or row["rep"] in reps]
-        if not filtered:
-            filtered = SALES_DATA
-        total_leads = sum(item["leads"] for item in filtered)
-        total_qualified = sum(item["qualified"] for item in filtered)
-        total_deals = sum(item["deals"] for item in filtered)
-        conversion = round(total_deals / total_leads, 3) if total_leads else 0.0
-        qualification = round(total_qualified / total_leads, 3) if total_leads else 0.0
-        avg_cycle = round(mean(item["avg_cycle_days"] for item in filtered), 1)
-        weak_rep = min(filtered, key=lambda item: item["deals"] / item["leads"] if item["leads"] else 0)
-        risks = [item for item in RISK_CUSTOMERS if not reps or item["owner"] in reps]
+    def run(self, workflow_type: WorkflowType, payload: dict[str, Any]) -> tuple[dict[str, Any], ToolCall]:
+        if workflow_type == WorkflowType.SALES_FOLLOWUP:
+            result = self._sales_analytics(payload)
+            return result, ToolCall(name="sales_analytics_tool", input=payload, output=result)
+        if workflow_type == WorkflowType.MARKETING_CAMPAIGN:
+            result = self._marketing_brief(payload)
+            return result, ToolCall(name="marketing_brief_tool", input=payload, output=result)
+        if workflow_type == WorkflowType.SUPPORT_TRIAGE:
+            result = self._support_triage(payload)
+            return result, ToolCall(name="support_triage_tool", input=payload, output=result)
+        result = self._meeting_extract(payload)
+        return result, ToolCall(name="meeting_minutes_tool", input=payload, output=result)
+
+    def _sales_analytics(self, payload: dict[str, Any]) -> dict[str, Any]:
+        region = payload.get("region")
+        reps = set(payload.get("sales_reps", []))
+        rows = [
+            row for row in SALES_DATA
+            if (not region or row["region"] == region) and (not reps or row["rep"] in reps)
+        ]
+        if not rows:
+            rows = SALES_DATA[:]
+        lead_count = sum(item["leads"] for item in rows)
+        qualified = sum(item["qualified"] for item in rows)
+        deals = sum(item["deals"] for item in rows)
+        avg_cycle_days = round(mean(item["avg_cycle_days"] for item in rows), 1)
+        conversion_rate = round(deals / lead_count, 2) if lead_count else 0.0
+        qualified_rate = round(qualified / lead_count, 2) if lead_count else 0.0
+        risk_customers = [item for item in RISK_CUSTOMERS if not reps or item["owner"] in reps]
         return {
-            "period": payload.get("period", "最近一周"),
             "focus_metric": payload.get("focus_metric", "conversion_rate"),
-            "summary": {
-                "lead_count": total_leads,
-                "qualified_count": total_qualified,
-                "deal_count": total_deals,
-                "qualification_rate": qualification,
-                "conversion_rate": conversion,
-                "avg_cycle_days": avg_cycle,
-            },
-            "weak_point": {
-                "rep": weak_rep["rep"],
-                "issue": "成交转化偏低且销售周期偏长",
-            },
-            "risk_customers": risks,
+            "period": payload.get("period", "当前周期"),
+            "region": region or "全区域",
+            "lead_count": lead_count,
+            "qualified_leads": qualified,
+            "deals": deals,
+            "conversion_rate": conversion_rate,
+            "qualified_rate": qualified_rate,
+            "avg_cycle_days": avg_cycle_days,
+            "risk_customers": risk_customers,
         }
 
-    def generate_marketing_assets(self, payload: dict[str, Any]) -> dict[str, Any]:
-        product = payload.get("product_name", "企业 AI 平台")
-        audience = payload.get("audience", "企业负责人")
-        benefits = payload.get("key_benefits") or ["效率提升", "可控落地"]
-        tone = payload.get("tone", "专业")
-        channels = payload.get("channels") or ["xiaohongshu"]
-        assets: dict[str, Any] = {}
-        if "xiaohongshu" in channels:
-            assets["xiaohongshu"] = {
-                "title": f"{product} 如何把 {benefits[0]} 真正落到团队里",
-                "body": f"给 {audience} 的一套实战方法：先梳理流程瓶颈，再让多智能体接管重复任务，最后用人工审核保证结果可落地。",
-            }
-        if "douyin" in channels:
-            assets["douyin"] = {
-                "hook": f"如果你的团队还在人工追任务，{product} 可以把流程自动跑起来。",
-                "script": [
-                    "第一幕：展示流程断点和协作混乱。",
-                    f"第二幕：演示 {product} 自动拆解任务、调工具、产出结果。",
-                    "第三幕：突出人工接管、日志可追踪和 ROI 提升。",
-                ],
-            }
-        if "wechat" in channels:
-            assets["wechat"] = {
-                "headline": f"{product}：企业流程自动化的下一步",
-                "summary": f"围绕 {', '.join(benefits)} 构建可审核、可追踪的 AI 执行体系。",
-            }
+    def _marketing_brief(self, payload: dict[str, Any]) -> dict[str, Any]:
+        channels = payload.get("channels", [])
+        product = payload.get("product_name", "目标产品")
+        benefits = payload.get("key_benefits", [])
         return {
-            "product": product,
-            "audience": audience,
-            "tone": tone,
-            "assets": assets,
-            "ab_test": [
-                {"variant": "A", "angle": "效率提升", "cta": "申请试点演示"},
-                {"variant": "B", "angle": "流程可控", "cta": "预约业务诊断"},
+            "product_name": product,
+            "audience": payload.get("audience", "目标用户"),
+            "tone": payload.get("tone", "专业"),
+            "core_benefits": benefits,
+            "channels": [
+                {
+                    "channel": channel,
+                    "angle": f"突出{benefits[min(index, len(benefits) - 1)]}" if benefits else "突出效率提升",
+                }
+                for index, channel in enumerate(channels)
             ],
+            "compliance_flags": ["需要人工审核对外表述", "避免承诺绝对效果"],
+            "launch_goal": f"围绕 {product} 完成多渠道内容预热",
         }
 
-    def triage_tickets(self, payload: dict[str, Any]) -> dict[str, Any]:
-        tickets = payload.get("tickets") or []
-        processed = []
-        for ticket in tickets:
-            text = ticket.get("message", "")
+    def _support_triage(self, payload: dict[str, Any]) -> dict[str, Any]:
+        results = []
+        handoff = False
+        for ticket in payload.get("tickets", []):
+            message = ticket.get("message", "")
             priority = "medium"
             category = "咨询"
-            escalate = False
-            if any(keyword in text for keyword in ["报错", "恢复", "上线", "故障", "宕机"]):
-                category = "技术故障"
-                priority = "urgent"
-                escalate = True
-            elif any(keyword in text for keyword in ["退款", "投诉"]):
-                category = "投诉退款"
+            if any(keyword in message for keyword in ["报错", "故障", "恢复", "上线"]):
+                priority = "critical"
+                category = "故障"
+                handoff = True
+            elif any(keyword in message for keyword in ["退款", "投诉"]):
                 priority = "high"
-                escalate = True
-            elif any(keyword in text for keyword in ["合同", "开票", "发票"]):
-                category = "商务咨询"
-                priority = "medium"
-            reply = {
-                "技术故障": "我们已将问题升级给值班工程师，15 分钟内同步初步排查结果。",
-                "投诉退款": "已安排专人核实订单与服务记录，今天内给到处理方案。",
-                "商务咨询": "支持开票与合同模板下载，我这边同步发你标准流程和所需资料。",
-                "咨询": "已收到你的问题，我们会尽快整理答案并回复。",
-            }[category]
-            processed.append(
+                category = "投诉"
+                handoff = True
+            elif "开票" in message or "合同" in message:
+                priority = "low"
+                category = "商务支持"
+            results.append(
                 {
                     "customer": ticket.get("customer", "未知客户"),
                     "category": category,
                     "priority": priority,
-                    "escalate": escalate,
-                    "draft_reply": reply,
+                    "reply_outline": f"先确认问题背景，再给出{category}处理路径。",
                 }
             )
         return {
-            "ticket_count": len(processed),
-            "processed": processed,
-            "priority_breakdown": dict(Counter(item["priority"] for item in processed)),
+            "ticket_count": len(results),
+            "tickets": results,
+            "needs_handoff": handoff,
         }
 
-    def extract_meeting_actions(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _meeting_extract(self, payload: dict[str, Any]) -> dict[str, Any]:
         notes = payload.get("notes", "")
-        segments = [segment.strip(" ；。") for segment in re.split(r"[；\n]+", notes) if segment.strip()]
-        actions = []
-        for segment in segments:
-            match = re.search(
-                r"(?P<owner>[\u4e00-\u9fa5]{2,4}).{0,4}(?P<deadline>本周五前|下周二前|今天下班前|本周内|下周内)?(?P<task>.+)",
-                segment,
+        items = []
+        for raw in re.split(r"[；;。]\s*|\n", notes):
+            raw = raw.strip()
+            if not raw:
+                continue
+            raw = re.sub(r"^\d+\.\s*", "", raw)
+            owner = raw[:2] if len(raw) >= 2 else "待定"
+            deadline_match = re.search(r"(本周[一二三四五六日天]|下周[一二三四五六日天]|今天|明天)", raw)
+            items.append(
+                {
+                    "owner": owner,
+                    "deadline": deadline_match.group(1) if deadline_match else "待确认",
+                    "task": raw,
+                }
             )
-            if match:
-                owner = match.group("owner")
-                deadline = match.group("deadline") or "待确认"
-                task = match.group("task").strip("负责需要将")
-                actions.append({"owner": owner, "deadline": deadline, "task": task})
-            else:
-                actions.append({"owner": "待分配", "deadline": "待确认", "task": segment})
         return {
-            "meeting_title": payload.get("meeting_title", "会议纪要"),
-            "actions": actions,
-            "summary_email": (
-                f"会议《{payload.get('meeting_title', '会议纪要')}》已整理完成，"
-                f"共提取 {len(actions)} 项待办，请各负责人按时推进。"
-            ),
+            "meeting_title": payload.get("meeting_title", "会议"),
+            "action_items": items,
+            "summary": f"共提取 {len(items)} 条待办事项",
         }
 
 
 class AnalystAgent:
-    def __init__(self, llm: LLMService) -> None:
-        self.llm = llm
+    def __init__(self, llm_service: LLMService) -> None:
+        self.llm_service = llm_service
 
-    def analyze(
+    def run(
         self,
-        workflow_type: WorkflowType,
+        run: WorkflowRun,
         raw_result: dict[str, Any],
+        prompt_profile: PromptProfile,
         execution_profile: ExecutionProfile,
-    ) -> tuple[dict[str, Any], LLMCall]:
-        fallback = self._fallback_analysis(workflow_type, raw_result)
-        prompt_definition = get_prompt_definition(execution_profile.prompt_profile.profile_id)
-        prompt = {
-            "workflow_type": workflow_type.value,
-            "raw_result": raw_result,
-            "required_keys": ["insights", "action_plan"],
-        }
-        response = self.llm.generate_json(
-            system_prompt=(
-                "你是企业工作流平台中的 Analyst Agent。"
-                "请根据输入数据输出纯 JSON，必须包含 insights 和 action_plan 两个数组。"
-                "每个数组至少 2 条，使用简洁专业的中文表达，不要输出 markdown。"
-                f"当前 Prompt 方案：{execution_profile.prompt_profile.name} {execution_profile.prompt_profile.version}。"
-                f"{prompt_definition.analyst_instruction}"
-            ),
-            user_prompt=json.dumps(prompt, ensure_ascii=False),
+    ) -> tuple[dict[str, Any], Any]:
+        fallback = self._fallback(run.workflow_type, raw_result)
+        system_prompt = (
+            "你是企业 AI 工作流中的分析 Agent。"
+            f"{prompt_profile.analyst_instruction}"
+            "请输出 JSON，字段必须包含 summary、insights、action_plan。"
+        )
+        user_prompt = json.dumps(
+            {
+                "workflow_type": run.workflow_type.value,
+                "objective": run.objective,
+                "raw_result": raw_result,
+            },
+            ensure_ascii=False,
+        )
+        response = self.llm_service.generate_json(
+            route_target="analyst",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             fallback=fallback,
             execution_profile=execution_profile,
         )
         return response.payload, response.call
 
-    @staticmethod
-    def _fallback_analysis(workflow_type: WorkflowType, raw_result: dict[str, Any]) -> dict[str, Any]:
+    def _fallback(self, workflow_type: WorkflowType, raw_result: dict[str, Any]) -> dict[str, Any]:
         if workflow_type == WorkflowType.SALES_FOLLOWUP:
-            summary = raw_result["summary"]
             return {
+                "summary": f"整体成交转化率为 {raw_result.get('conversion_rate', 0):.0%}，平均销售周期 {raw_result.get('avg_cycle_days', 0)} 天。",
                 "insights": [
-                    f"当前线索转化率为 {summary['conversion_rate']:.1%}，低于稳态目标。",
-                    f"资格转化率为 {summary['qualification_rate']:.1%}，说明筛选阶段仍有优化空间。",
-                    f"平均销售周期 {summary['avg_cycle_days']} 天，需要优先缩短中后段推进时长。",
+                    "当前销售漏斗存在明显瓶颈，需要优先处理高风险客户。",
+                    "销售周期偏长，说明推进节奏和资源协调仍有阻塞。",
                 ],
                 "action_plan": [
-                    "针对高风险客户安排 24 小时内跟进。",
-                    "对转化偏低销售补一轮演示复盘与异议处理脚本。",
-                    "按行业整理 ROI 材料，推动预算审批场景。",
+                    "针对高风险客户安排一对一复盘和下一步推进动作。",
+                    "补充 ROI 材料，推动卡点客户决策。",
                 ],
+            }
+        if workflow_type == WorkflowType.MARKETING_CAMPAIGN:
+            return {
+                "summary": "内容生成已完成，但对外表达和品牌调性仍需人工确认。",
+                "insights": ["不同渠道需要差异化表达。", "投放前需要检查合规和夸张表述。"],
+                "action_plan": ["保留一版对外发布草案。", "交由人工审核后再统一发布。"],
             }
         if workflow_type == WorkflowType.SUPPORT_TRIAGE:
-            processed = raw_result["processed"]
-            urgent = [item for item in processed if item["priority"] == "urgent"]
             return {
-                "insights": [
-                    f"本批工单共 {len(processed)} 条，其中紧急工单 {len(urgent)} 条。",
-                    "技术故障和投诉退款类问题需要优先人工跟进。",
-                ],
-                "action_plan": [
-                    "紧急工单进入值班群和客户成功经理双通知。",
-                    "商务咨询统一走标准资料包，提高首响效率。",
-                ],
-            }
-        if workflow_type == WorkflowType.MEETING_MINUTES:
-            actions = raw_result["actions"]
-            return {
-                "insights": [
-                    f"共抽取 {len(actions)} 个执行项，适合直接同步到任务系统。",
-                    "纪要中出现了缺少明确截止时间的事项，建议补齐。",
-                ],
-                "action_plan": [
-                    "会后 30 分钟内发出总结邮件。",
-                    "对截止时间缺失事项追加确认。",
-                ],
+                "summary": f"共处理 {raw_result.get('ticket_count', 0)} 条工单，存在需要人工接管的高风险问题。",
+                "insights": ["故障类工单影响上线。", "商务支持类工单可标准化回复。"],
+                "action_plan": ["高优先级工单立即升级值班工程师。", "低优先级工单使用模板回复。"],
             }
         return {
-            "insights": [
-                "内容已按渠道拆分，可直接进入投放准备。",
-                "建议保留两套版本做 A/B 测试。",
-            ],
-            "action_plan": [
-                "先投放小红书版本验证信息密度。",
-                "将高反馈卖点同步到销售话术。",
-            ],
+            "summary": raw_result.get("summary", "会议纪要已完成结构化整理。"),
+            "insights": ["行动项已经拆解为负责人和时间节点。", "适合直接同步到任务面板。"],
+            "action_plan": ["确认关键任务负责人。", "发送会后总结并跟踪执行。"],
         }
 
 
 class ContentAgent:
-    def __init__(self, llm: LLMService) -> None:
-        self.llm = llm
+    def __init__(self, llm_service: LLMService) -> None:
+        self.llm_service = llm_service
 
-    def refine(
+    def run(
         self,
-        workflow_type: WorkflowType,
+        run: WorkflowRun,
         raw_result: dict[str, Any],
         analysis: dict[str, Any],
+        prompt_profile: PromptProfile,
         execution_profile: ExecutionProfile,
-    ) -> tuple[dict[str, Any], LLMCall]:
-        fallback = self._fallback_content(workflow_type, raw_result)
-        prompt_definition = get_prompt_definition(execution_profile.prompt_profile.profile_id)
-        prompt = {
-            "workflow_type": workflow_type.value,
-            "raw_result": raw_result,
-            "analysis": analysis,
-            "fallback_shape": fallback,
-        }
-        response = self.llm.generate_json(
-            system_prompt=(
-                "你是企业工作流平台中的 Content Agent。"
-                "请根据业务分析结果输出纯 JSON，字段结构尽量贴合 fallback_shape。"
-                "内容必须是中文，便于业务同学直接使用。"
-                f"当前 Prompt 方案：{execution_profile.prompt_profile.name} {execution_profile.prompt_profile.version}。"
-                f"{prompt_definition.content_instruction}"
-            ),
-            user_prompt=json.dumps(prompt, ensure_ascii=False),
+    ) -> tuple[dict[str, Any], Any]:
+        fallback = self._fallback(run.workflow_type, raw_result, analysis)
+        system_prompt = (
+            "你是企业 AI 工作流中的内容 Agent。"
+            f"{prompt_profile.content_instruction}"
+            "请输出 JSON，字段必须包含 deliverables 和 manager_note。"
+        )
+        user_prompt = json.dumps(
+            {
+                "workflow_type": run.workflow_type.value,
+                "objective": run.objective,
+                "raw_result": raw_result,
+                "analysis": analysis,
+            },
+            ensure_ascii=False,
+        )
+        response = self.llm_service.generate_json(
+            route_target="content",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             fallback=fallback,
             execution_profile=execution_profile,
         )
         return response.payload, response.call
 
-    @staticmethod
-    def _fallback_content(workflow_type: WorkflowType, raw_result: dict[str, Any]) -> dict[str, Any]:
+    def _fallback(self, workflow_type: WorkflowType, raw_result: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
         if workflow_type == WorkflowType.SALES_FOLLOWUP:
             return {
-                "daily_brief": "销售漏斗存在中段转化偏弱，建议围绕高风险客户和演示复盘做集中推进。",
-                "manager_note": "将风险客户推进动作纳入明早站会追踪。",
+                "deliverables": {
+                    "daily_brief": analysis.get("summary", ""),
+                    "manager_note": "建议销售经理确认高风险客户的一对一辅导资源。",
+                },
+                "manager_note": "优先安排本周高风险客户复盘。",
+            }
+        if workflow_type == WorkflowType.MARKETING_CAMPAIGN:
+            channels = raw_result.get("channels", [])
+            return {
+                "deliverables": {
+                    "content_assets": [
+                        {"channel": item["channel"], "copy": f"围绕{item['angle']}输出一版首发文案。"}
+                        for item in channels
+                    ],
+                    "review_hint": "对外发布前需人工审核措辞和合规风险。",
+                },
+                "manager_note": "建议先审核，再按渠道分发。",
             }
         if workflow_type == WorkflowType.SUPPORT_TRIAGE:
-            return {"handoff_note": "紧急故障类工单已建议升级，商务咨询类可自动回复后转销售支持。"}
-        if workflow_type == WorkflowType.MEETING_MINUTES:
-            return {"followup_message": raw_result["summary_email"]}
+            return {
+                "deliverables": {
+                    "reply_templates": [
+                        {
+                            "customer": ticket["customer"],
+                            "reply": f"已收到{ticket['category']}问题，我们会尽快处理并同步进展。",
+                        }
+                        for ticket in raw_result.get("tickets", [])
+                    ]
+                },
+                "manager_note": "高优先级工单需要人工确认升级路径。",
+            }
         return {
-            "campaign_note": "建议先用效率提升角度开首轮投放，再根据互动率决定是否强化流程可控卖点。"
+            "deliverables": {
+                "summary_mail": analysis.get("summary", ""),
+                "task_board": raw_result.get("action_items", []),
+            },
+            "manager_note": "可直接同步到项目群和任务系统。",
         }
 
 
 class ReviewerAgent:
-    AUTO_EXECUTE_HINTS = ("可直接流转执行", "可直接执行", "结果结构完整", "自动完成")
-    MANUAL_REVIEW_HINTS = ("人工", "复核", "确认", "升级", "待确认", "风险", "合规")
+    def __init__(self, llm_service: LLMService) -> None:
+        self.llm_service = llm_service
 
-    def __init__(self, llm: LLMService) -> None:
-        self.llm = llm
-
-    def review(
+    def run(
         self,
-        workflow_type: WorkflowType,
+        run: WorkflowRun,
         raw_result: dict[str, Any],
         analysis: dict[str, Any],
+        deliverables: dict[str, Any],
+        prompt_profile: PromptProfile,
         execution_profile: ExecutionProfile,
-    ) -> tuple[ReviewDecision, LLMCall]:
-        fallback = self._fallback_review(workflow_type, raw_result)
-        prompt_definition = get_prompt_definition(execution_profile.prompt_profile.profile_id)
-        prompt = {
-            "workflow_type": workflow_type.value,
-            "raw_result": raw_result,
-            "analysis": analysis,
-            "allowed_status": ["completed", "waiting_human"],
-            "required_keys": ["status", "needs_human_review", "score", "reasons"],
-        }
-        response = self.llm.generate_json(
-            system_prompt=(
-                "你是企业工作流平台中的 Reviewer Agent。"
-                "请输出纯 JSON。status 只能是 completed 或 waiting_human。"
-                "score 取值 0 到 1，reasons 是中文数组。"
-                f"当前 Prompt 方案：{execution_profile.prompt_profile.name} {execution_profile.prompt_profile.version}。"
-                f"{prompt_definition.reviewer_instruction}"
-            ),
-            user_prompt=json.dumps(prompt, ensure_ascii=False),
-            fallback=fallback,
+    ) -> tuple[dict[str, Any], Any]:
+        rule_review = self._rule_review(run.workflow_type, raw_result)
+        system_prompt = (
+            "你是企业 AI 工作流中的审核 Agent。"
+            f"{prompt_profile.reviewer_instruction}"
+            "请输出 JSON，字段必须包含 status、needs_human_review、score、reasons。"
+        )
+        user_prompt = json.dumps(
+            {
+                "workflow_type": run.workflow_type.value,
+                "raw_result": raw_result,
+                "analysis": analysis,
+                "deliverables": deliverables,
+                "rule_review": rule_review,
+            },
+            ensure_ascii=False,
+        )
+        response = self.llm_service.generate_json(
+            route_target="reviewer",
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            fallback=rule_review,
             execution_profile=execution_profile,
         )
-        return ReviewDecision(**self._merge_review(fallback, response.payload)), response.call
+        merged = self._merge_review(rule_review, response.payload)
+        return merged, response.call
+
+    def _rule_review(self, workflow_type: WorkflowType, raw_result: dict[str, Any]) -> dict[str, Any]:
+        if workflow_type == WorkflowType.MARKETING_CAMPAIGN:
+            return {
+                "status": "waiting_human",
+                "needs_human_review": True,
+                "score": 0.68,
+                "reasons": ["对外营销内容默认进入人工审核，需确认品牌表述和合规边界。"],
+            }
+        if workflow_type == WorkflowType.SUPPORT_TRIAGE and raw_result.get("needs_handoff"):
+            return {
+                "status": "waiting_human",
+                "needs_human_review": True,
+                "score": 0.62,
+                "reasons": ["存在高优先级故障工单，需要人工接管和升级确认。"],
+            }
+        if workflow_type == WorkflowType.SALES_FOLLOWUP and raw_result.get("risk_customers"):
+            return {
+                "status": "waiting_human",
+                "needs_human_review": True,
+                "score": 0.65,
+                "reasons": ["涉及高风险客户和辅导计划，建议销售经理人工确认。"],
+            }
+        return {
+            "status": "completed",
+            "needs_human_review": False,
+            "score": 0.88,
+            "reasons": ["结果结构完整，可直接流转执行。"],
+        }
 
     @staticmethod
-    def _fallback_review(workflow_type: WorkflowType, raw_result: dict[str, Any]) -> dict[str, Any]:
-        reasons: list[str] = []
-        score = 0.92
-        needs_human_review = False
-        status = RunStatus.COMPLETED.value
-        if workflow_type == WorkflowType.SUPPORT_TRIAGE:
-            urgent_count = raw_result["priority_breakdown"].get("urgent", 0)
-            if urgent_count:
-                reasons.append("存在紧急工单，建议人工确认升级路径。")
-                needs_human_review = True
-                status = RunStatus.WAITING_HUMAN.value
-                score = 0.81
-        elif workflow_type == WorkflowType.MEETING_MINUTES:
-            if any(action["deadline"] == "待确认" for action in raw_result["actions"]):
-                reasons.append("部分行动项缺少明确截止时间。")
-                needs_human_review = True
-                status = RunStatus.WAITING_HUMAN.value
-                score = 0.84
-        elif workflow_type == WorkflowType.MARKETING_CAMPAIGN:
-            reasons.append("建议投放前做品牌与合规复核。")
-            needs_human_review = True
-            status = RunStatus.WAITING_HUMAN.value
-            score = 0.86
-        else:
-            reasons.append("结果结构完整，可直接流转执行。")
+    def _merge_review(rule_review: dict[str, Any], llm_review: dict[str, Any]) -> dict[str, Any]:
+        status = str(llm_review.get("status") or rule_review.get("status") or "completed")
+        status_alias = {"approved": "completed", "approve": "completed", "rejected": "failed", "reject": "failed"}
+        status = status_alias.get(status, status)
+        needs_human = bool(llm_review.get("needs_human_review", rule_review.get("needs_human_review", False)))
+        if needs_human:
+            status = "waiting_human"
+        elif status == "waiting_human":
+            status = "completed"
+        score = float(llm_review.get("score", rule_review.get("score", 0.8)))
+        reasons = [*rule_review.get("reasons", []), *llm_review.get("reasons", [])]
+        filtered = []
+        for reason in reasons:
+            text = str(reason)
+            if status == "waiting_human" and ("可直接流转" in text or "自动执行" in text):
+                continue
+            if status == "completed" and ("人工审核" in text or "人工确认" in text or "人工接管" in text):
+                continue
+            if text not in filtered:
+                filtered.append(text)
+        if not filtered:
+            filtered = ["需要人工确认后再继续执行。"] if status == "waiting_human" else ["结果结构完整，可直接流转执行。"]
         return {
             "status": status,
-            "needs_human_review": needs_human_review,
-            "score": score,
-            "reasons": reasons,
+            "needs_human_review": status == "waiting_human",
+            "score": round(max(0.0, min(score, 1.0)), 2),
+            "reasons": filtered,
         }
-
-    @staticmethod
-    def _merge_review(rule_payload: dict[str, Any], llm_payload: dict[str, Any]) -> dict[str, Any]:
-        merged_reasons = []
-        for reason in [*(rule_payload.get("reasons") or []), *(llm_payload.get("reasons") or [])]:
-            if reason and reason not in merged_reasons:
-                merged_reasons.append(reason)
-
-        if rule_payload.get("needs_human_review"):
-            final_status = RunStatus.WAITING_HUMAN.value
-            return {
-                "status": final_status,
-                "needs_human_review": True,
-                "score": min(float(rule_payload.get("score", 1.0)), float(llm_payload.get("score", 1.0))),
-                "reasons": ReviewerAgent._normalize_reasons_for_status(merged_reasons, final_status),
-            }
-
-        llm_requests_handoff = bool(llm_payload.get("needs_human_review")) or llm_payload.get("status") == RunStatus.WAITING_HUMAN.value
-        final_status = RunStatus.WAITING_HUMAN.value if llm_requests_handoff else RunStatus.COMPLETED.value
-        return {
-            "status": final_status,
-            "needs_human_review": llm_requests_handoff,
-            "score": float(llm_payload.get("score", rule_payload.get("score", 0.9))),
-            "reasons": ReviewerAgent._normalize_reasons_for_status(
-                merged_reasons or rule_payload.get("reasons", []),
-                final_status,
-            ),
-        }
-
-    @classmethod
-    def _normalize_reasons_for_status(cls, reasons: list[str], status: str) -> list[str]:
-        cleaned = [reason.strip() for reason in reasons if reason and reason.strip()]
-        if status == RunStatus.WAITING_HUMAN.value:
-            filtered = [reason for reason in cleaned if not cls._is_auto_execute_reason(reason)]
-            return filtered or ["需要人工确认后再继续流转。"]
-        if status == RunStatus.COMPLETED.value:
-            filtered = [reason for reason in cleaned if not cls._is_manual_review_reason(reason)]
-            return filtered or ["结果结构完整，可直接流转执行。"]
-        return cleaned
-
-    @classmethod
-    def _is_auto_execute_reason(cls, reason: str) -> bool:
-        return any(hint in reason for hint in cls.AUTO_EXECUTE_HINTS)
-
-    @classmethod
-    def _is_manual_review_reason(cls, reason: str) -> bool:
-        return any(hint in reason for hint in cls.MANUAL_REVIEW_HINTS)
 
 
 class WorkflowEngine:
     def __init__(self, repository: WorkflowRepository, settings: Settings) -> None:
         self.repository = repository
         self.settings = settings
-        self.llm = LLMService(settings)
+        self.prompt_service = PromptProfileService(repository)
+        self.llm_service = LLMService(settings)
         self.planner = PlannerAgent()
-        self.tools = ToolCenter()
-        self.analyst = AnalystAgent(self.llm)
-        self.content = ContentAgent(self.llm)
-        self.reviewer = ReviewerAgent(self.llm)
+        self.tool_center = ToolCenter()
+        self.analyst = AnalystAgent(self.llm_service)
+        self.content = ContentAgent(self.llm_service)
+        self.reviewer = ReviewerAgent(self.llm_service)
         self.graph = self._build_graph()
-        self.graph_definition = self._build_graph_definition()
 
     def list_templates(self) -> list[dict[str, Any]]:
         return [template.model_dump(mode="json") for template in WORKFLOW_TEMPLATES]
@@ -497,8 +547,20 @@ class WorkflowEngine:
     def list_model_options(self) -> list[dict[str, str]]:
         return list_model_options()
 
-    def list_prompt_profiles(self) -> list[dict[str, str]]:
-        return list_prompt_profiles()
+    def list_routing_policies(self) -> list[dict[str, str]]:
+        return list_routing_policies()
+
+    def list_prompt_profiles(self) -> list[PromptProfile]:
+        return self.prompt_service.list_profiles()
+
+    def get_prompt_profile(self, profile_id: str) -> PromptProfile:
+        return self.prompt_service.get_profile(profile_id)
+
+    def create_prompt_profile(self, form: PromptProfileForm) -> PromptProfile:
+        return self.prompt_service.create_profile(form)
+
+    def update_prompt_profile(self, profile_id: str, form: PromptProfileForm) -> PromptProfile:
+        return self.prompt_service.update_profile(profile_id, form)
 
     def list_runs(self) -> list[WorkflowRun]:
         return self.repository.list_all()
@@ -509,217 +571,265 @@ class WorkflowEngine:
     def get_run(self, run_id: str) -> WorkflowRun | None:
         return self.repository.get(run_id)
 
-    def get_graph_definition(self) -> dict[str, Any]:
-        return self.graph_definition
+    def build_execution_profile(self, request: WorkflowRequest) -> tuple[PromptProfile, ExecutionProfile]:
+        prompt_profile = self.prompt_service.get_profile(request.prompt_profile_id)
+        execution_profile = resolve_execution_profile(
+            default_model_name=self.settings.model_name,
+            prompt_profile=prompt_profile,
+            model_name_override=request.model_name_override,
+            routing_policy_id=request.routing_policy_id or DEFAULT_ROUTING_POLICY_ID,
+        )
+        return prompt_profile, execution_profile
 
-    def submit_review(self, run_id: str, approve: bool, comment: str = "", reviewer_name: str = "人工审核") -> WorkflowRun | None:
+    def run_workflow(self, request: WorkflowRequest, persist: bool = True) -> WorkflowRun:
+        prompt_profile, execution_profile = self.build_execution_profile(request)
+        run = WorkflowRun(workflow_type=request.workflow_type, input_payload=request.input_payload)
+        state: WorkflowState = {
+            "run": run,
+            "request": request,
+            "execution_profile": execution_profile,
+            "prompt_profile": prompt_profile,
+            "persist": persist,
+        }
+        result = self.graph.invoke(state)
+        final_run = result["run"]
+        if persist:
+            self.repository.save(final_run)
+        return final_run
+
+    def submit_review(self, run_id: str, approve: bool, comment: str, reviewer_name: str) -> WorkflowRun | None:
         run = self.repository.get(run_id)
         if run is None:
             return None
-        if run.status != RunStatus.WAITING_HUMAN:
-            return run
-        run.touch(
+        run.review = ReviewDecision(
             status=RunStatus.COMPLETED if approve else RunStatus.FAILED,
-            current_step="human_review",
+            needs_human_review=not approve,
+            score=run.review.score if run.review else 0.7,
+            reasons=[comment or ("审核通过，允许流转执行。" if approve else "审核驳回，请补充后重试。")],
         )
-        run.add_log(
-            "HumanReviewer",
-            f"{reviewer_name}"
-            + (" 已人工审核通过。" if approve else " 已人工审核驳回。")
-            + (f" 备注：{comment}" if comment else ""),
-        )
-        if run.review is not None:
-            reasons = list(run.review.reasons)
-            reasons.append(f"{reviewer_name}" + ("人工审核通过" if approve else "人工审核驳回") + (f"：{comment}" if comment else ""))
-            run.review = ReviewDecision(
-                status=RunStatus.COMPLETED if approve else RunStatus.FAILED,
-                needs_human_review=False,
-                score=run.review.score,
-                reasons=reasons,
-            )
+        run.touch(status=run.review.status, current_step="human_review")
+        verdict = "通过" if approve else "驳回"
+        run.add_log("ReviewerAgent", f"审核负责人 {reviewer_name} 已{verdict}任务：{comment or '无补充说明'}")
         self.repository.save(run)
         return run
 
-    def run_workflow(self, request: WorkflowRequest) -> WorkflowRun:
-        execution_profile = resolve_execution_profile(
-            default_model_name=self.settings.model_name,
-            model_name_override=request.model_name_override,
-            prompt_profile_id=request.prompt_profile_id,
-        )
-        run = WorkflowRun(
-            workflow_type=request.workflow_type,
-            input_payload=request.input_payload,
-            result={"execution_profile": execution_profile.model_dump(mode="json")},
-        )
-        self.repository.save(run)
-        final_state = self.graph.invoke({"request": request, "run": run, "execution_profile": execution_profile})
-        final_run = final_state["run"]
-        self.repository.save(final_run)
-        return final_run
-
-    def _build_graph(self):
-        builder = StateGraph(WorkflowState)
-        builder.add_node("planner", self._planner_node)
-        builder.add_node("operator", self._operator_node)
-        builder.add_node("analyst", self._analyst_node)
-        builder.add_node("content", self._content_node)
-        builder.add_node("reviewer", self._reviewer_node)
-        builder.add_node("complete_run", self._complete_node)
-        builder.add_node("handoff_run", self._handoff_node)
-
-        builder.add_edge(START, "planner")
-        builder.add_edge("planner", "operator")
-        builder.add_edge("operator", "analyst")
-        builder.add_edge("analyst", "content")
-        builder.add_edge("content", "reviewer")
-        builder.add_conditional_edges(
-            "reviewer",
-            self._route_after_review,
-            {
-                "complete": "complete_run",
-                "handoff": "handoff_run",
-            },
-        )
-        builder.add_edge("complete_run", END)
-        builder.add_edge("handoff_run", END)
-        return builder.compile()
-
-    def _build_graph_definition(self) -> dict[str, Any]:
+    def get_graph_definition(self) -> dict[str, Any]:
         return {
             "runtime": "langgraph",
             "entrypoint": "planner",
-            "nodes": [
-                "planner",
-                "operator",
-                "analyst",
-                "content",
-                "reviewer",
-                "complete_run",
-                "handoff_run",
-            ],
+            "nodes": ["planner", "operator", "analyst", "content", "reviewer"],
             "edges": [
-                {"from": "START", "to": "planner"},
                 {"from": "planner", "to": "operator"},
                 {"from": "operator", "to": "analyst"},
                 {"from": "analyst", "to": "content"},
                 {"from": "content", "to": "reviewer"},
-                {"from": "reviewer", "to": "complete_run", "condition": "review.status == completed"},
-                {"from": "reviewer", "to": "handoff_run", "condition": "review.status == waiting_human"},
-                {"from": "complete_run", "to": "END"},
-                {"from": "handoff_run", "to": "END"},
+                {"from": "reviewer", "to": "END"},
             ],
         }
 
+    def _build_graph(self):
+        graph = StateGraph(WorkflowState)
+        graph.add_node("planner", self._planner_node)
+        graph.add_node("operator", self._operator_node)
+        graph.add_node("analyst", self._analyst_node)
+        graph.add_node("content", self._content_node)
+        graph.add_node("reviewer", self._reviewer_node)
+        graph.add_edge(START, "planner")
+        graph.add_edge("planner", "operator")
+        graph.add_edge("operator", "analyst")
+        graph.add_edge("analyst", "content")
+        graph.add_edge("content", "reviewer")
+        graph.add_edge("reviewer", END)
+        return graph.compile()
+
+    def _save_if_needed(self, state: WorkflowState) -> None:
+        if state.get("persist"):
+            self.repository.save(state["run"])
+
     def _planner_node(self, state: WorkflowState) -> WorkflowState:
-        request = state["request"]
         run = state["run"]
-        execution_profile = state["execution_profile"]
-        run.touch(status=RunStatus.PLANNING, current_step="planning")
-        plan = self.planner.build_plan(request)
+        request = state["request"]
+        plan = self.planner.plan(request)
         run.plan = plan
         run.objective = plan.objective
-        run.add_log(
-            "PlannerAgent",
-            f"已生成执行计划，共 {len(plan.steps)} 步。模型：{execution_profile.model_name}；Prompt：{execution_profile.prompt_profile.name} {execution_profile.prompt_profile.version}。",
-        )
-        self.repository.save(run)
-        return {"run": run}
+        run.touch(status=RunStatus.PLANNING, current_step="planner")
+        run.add_log("PlannerAgent", f"已生成执行计划，共 {len(plan.steps)} 步。")
+        self._save_if_needed(state)
+        return state
 
     def _operator_node(self, state: WorkflowState) -> WorkflowState:
-        request = state["request"]
         run = state["run"]
-        raw_result, tool_name = self._execute_tool(request.workflow_type, request.input_payload)
-        run.touch(status=RunStatus.EXECUTING, current_step="tool_execution")
-        run.add_log(
-            "OperatorAgent",
-            f"完成工具调用：{tool_name}",
-            tool_call=ToolCall(name=tool_name, input=request.input_payload, output=raw_result),
-        )
-        self.repository.save(run)
-        return {"run": run, "raw_result": raw_result}
+        request = state["request"]
+        raw_result, tool_call = self.tool_center.run(request.workflow_type, request.input_payload)
+        state["raw_result"] = raw_result
+        run.touch(status=RunStatus.EXECUTING, current_step="operator")
+        run.add_log("OperatorAgent", f"完成工具调用：{tool_call.name}", tool_call=tool_call)
+        self._save_if_needed(state)
+        return state
 
     def _analyst_node(self, state: WorkflowState) -> WorkflowState:
-        request = state["request"]
         run = state["run"]
-        raw_result = state["raw_result"]
-        execution_profile = state["execution_profile"]
-        analysis, llm_call = self.analyst.analyze(request.workflow_type, raw_result, execution_profile)
-        run.touch(status=RunStatus.EXECUTING, current_step="analysis")
-        run.add_log(
-            "AnalystAgent",
-            "已完成结果分析与行动建议整理。"
-            + ("（已调用真实模型）" if self.llm.enabled else "（当前为本地回退策略）"),
-            llm_call=llm_call,
-        )
-        self.repository.save(run)
-        return {"run": run, "analysis": analysis}
+        analysis, llm_call = self.analyst.run(run, state["raw_result"], state["prompt_profile"], state["execution_profile"])
+        state["analysis"] = analysis
+        run.touch(status=RunStatus.EXECUTING, current_step="analyst")
+        run.add_log("AnalystAgent", "已完成结果分析与行动建议整理。", llm_call=llm_call)
+        self._save_if_needed(state)
+        return state
 
     def _content_node(self, state: WorkflowState) -> WorkflowState:
-        request = state["request"]
         run = state["run"]
-        raw_result = state["raw_result"]
-        analysis = state["analysis"]
-        execution_profile = state["execution_profile"]
-        deliverables, llm_call = self.content.refine(request.workflow_type, raw_result, analysis, execution_profile)
-        run.touch(status=RunStatus.EXECUTING, current_step="content")
-        run.add_log(
-            "ContentAgent",
-            "已补充业务可直接使用的输出内容。"
-            + ("（已调用真实模型）" if self.llm.enabled else "（当前为本地回退策略）"),
-            llm_call=llm_call,
+        deliverables, llm_call = self.content.run(
+            run,
+            state["raw_result"],
+            state["analysis"],
+            state["prompt_profile"],
+            state["execution_profile"],
         )
-        self.repository.save(run)
-        return {"run": run, "deliverables": deliverables}
+        state["deliverables"] = deliverables
+        run.touch(status=RunStatus.REVIEWING, current_step="content")
+        run.add_log("ContentAgent", "已补充业务可直接使用的输出内容。", llm_call=llm_call)
+        self._save_if_needed(state)
+        return state
 
     def _reviewer_node(self, state: WorkflowState) -> WorkflowState:
-        request = state["request"]
         run = state["run"]
-        raw_result = state["raw_result"]
-        analysis = state["analysis"]
-        execution_profile = state["execution_profile"]
-        review, llm_call = self.reviewer.review(request.workflow_type, raw_result, analysis, execution_profile)
-        run.touch(status=RunStatus.REVIEWING, current_step="review")
-        run.review = review
-        run.result = {
-            "execution_profile": execution_profile.model_dump(mode="json"),
-            "raw_result": raw_result,
-            "analysis": analysis,
-            "deliverables": state["deliverables"],
-        }
-        run.add_log(
-            "ReviewerAgent",
-            "已完成质量审核与人工接管判断。"
-            + ("（已调用真实模型）" if self.llm.enabled else "（当前为本地回退策略）"),
-            llm_call=llm_call,
+        review_payload, llm_call = self.reviewer.run(
+            run,
+            state["raw_result"],
+            state["analysis"],
+            state["deliverables"],
+            state["prompt_profile"],
+            state["execution_profile"],
         )
-        self.repository.save(run)
-        return {"run": run, "review": review}
+        run.review = ReviewDecision(**review_payload)
+        run.result = {
+            "execution_profile": state["execution_profile"].model_dump(mode="json"),
+            "prompt_profile_snapshot": state["prompt_profile"].model_dump(mode="json"),
+            "raw_result": state["raw_result"],
+            "analysis": state["analysis"],
+            "deliverables": state["deliverables"],
+            "metadata": state["request"].metadata,
+        }
+        final_status = RunStatus.WAITING_HUMAN if review_payload["status"] == "waiting_human" else RunStatus.COMPLETED
+        run.touch(status=final_status, current_step="reviewer")
+        message = "已完成质量审核与人工接管判断。"
+        if final_status == RunStatus.WAITING_HUMAN:
+            message = "已完成质量审核，任务进入人工接管。"
+        run.add_log("ReviewerAgent", message, llm_call=llm_call)
+        self._save_if_needed(state)
+        return state
 
-    def _complete_node(self, state: WorkflowState) -> WorkflowState:
-        run = state["run"]
-        review = state["review"]
-        run.touch(status=RunStatus(review.status), current_step="done")
-        run.add_log("WorkflowRuntime", "LangGraph 状态流已自动完成本次工作流。")
-        self.repository.save(run)
-        return {"run": run}
 
-    def _handoff_node(self, state: WorkflowState) -> WorkflowState:
-        run = state["run"]
-        run.touch(status=RunStatus.WAITING_HUMAN, current_step="waiting_human")
-        run.add_log("WorkflowRuntime", "LangGraph 状态流已将该任务转入人工接管。")
-        self.repository.save(run)
-        return {"run": run}
+class EvaluationService:
+    def __init__(self, repository: WorkflowRepository, engine: WorkflowEngine) -> None:
+        self.repository = repository
+        self.engine = engine
 
-    @staticmethod
-    def _route_after_review(state: WorkflowState) -> str:
-        review = state["review"]
-        return "handoff" if review.status == RunStatus.WAITING_HUMAN else "complete"
+    def list_datasets(self) -> list[dict[str, str]]:
+        return list_evaluation_datasets()
 
-    def _execute_tool(self, workflow_type: WorkflowType, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
-        if workflow_type == WorkflowType.SALES_FOLLOWUP:
-            return self.tools.analyze_sales(payload), "sales_analytics_tool"
-        if workflow_type == WorkflowType.MARKETING_CAMPAIGN:
-            return self.tools.generate_marketing_assets(payload), "content_factory_tool"
-        if workflow_type == WorkflowType.SUPPORT_TRIAGE:
-            return self.tools.triage_tickets(payload), "ticket_triage_tool"
-        return self.tools.extract_meeting_actions(payload), "meeting_action_extractor"
+    def list_evaluations(self) -> list[EvaluationRun]:
+        return self.repository.list_evaluations()
+
+    def get_evaluation(self, evaluation_id: str) -> EvaluationRun | None:
+        return self.repository.get_evaluation(evaluation_id)
+
+    def run_evaluation(
+        self,
+        *,
+        dataset_id: str,
+        candidate_request: WorkflowRequest,
+        baseline_request: WorkflowRequest,
+    ) -> EvaluationRun:
+        dataset = get_evaluation_dataset(dataset_id)
+        candidate_prompt, candidate_profile = self.engine.build_execution_profile(candidate_request)
+        baseline_prompt, baseline_profile = self.engine.build_execution_profile(baseline_request)
+        case_results: list[dict[str, Any]] = []
+        for case in dataset.cases:
+            candidate_run = self.engine.run_workflow(
+                WorkflowRequest(
+                    workflow_type=WorkflowType(case.workflow_type),
+                    input_payload=case.input_payload,
+                    model_name_override=candidate_request.model_name_override,
+                    prompt_profile_id=candidate_prompt.profile_id,
+                    routing_policy_id=candidate_request.routing_policy_id,
+                    metadata={"evaluation_case_id": case.case_id, "lane": "candidate"},
+                ),
+                persist=False,
+            )
+            baseline_run = self.engine.run_workflow(
+                WorkflowRequest(
+                    workflow_type=WorkflowType(case.workflow_type),
+                    input_payload=case.input_payload,
+                    model_name_override=baseline_request.model_name_override,
+                    prompt_profile_id=baseline_prompt.profile_id,
+                    routing_policy_id=baseline_request.routing_policy_id,
+                    metadata={"evaluation_case_id": case.case_id, "lane": "baseline"},
+                ),
+                persist=False,
+            )
+            candidate_score = self._score_case(candidate_run, case.expected_status, case.expected_keywords)
+            baseline_score = self._score_case(baseline_run, case.expected_status, case.expected_keywords)
+            case_results.append(
+                {
+                    "case_id": case.case_id,
+                    "title": case.title,
+                    "expected_status": case.expected_status,
+                    "candidate": candidate_score,
+                    "baseline": baseline_score,
+                    "delta": round(candidate_score["score"] - baseline_score["score"], 3),
+                }
+            )
+        evaluation = EvaluationRun(
+            dataset_id=dataset.dataset_id,
+            dataset_name=dataset.name,
+            candidate_profile=candidate_profile,
+            baseline_profile=baseline_profile,
+            summary=self._build_summary(case_results),
+            case_results=case_results,
+        )
+        return self.repository.save_evaluation(evaluation)
+
+    def _score_case(self, run: WorkflowRun, expected_status: str, expected_keywords: tuple[str, ...]) -> dict[str, Any]:
+        text = json.dumps(run.result, ensure_ascii=False)
+        keyword_hits = sum(1 for keyword in expected_keywords if keyword in text)
+        llm_calls = [log.llm_call for log in run.logs if log.llm_call]
+        total_tokens = sum(call.total_tokens for call in llm_calls)
+        total_latency = sum(call.latency_ms for call in llm_calls)
+        status_score = 1.0 if run.status.value == expected_status else 0.0
+        keyword_score = keyword_hits / max(len(expected_keywords), 1)
+        review_score = run.review.score if run.review else 0.0
+        structure_score = 1.0 if {"raw_result", "analysis", "deliverables"} <= set(run.result.keys()) else 0.0
+        score = round(status_score * 0.3 + keyword_score * 0.25 + review_score * 0.25 + structure_score * 0.2, 3)
+        return {
+            "status": run.status.value,
+            "score": score,
+            "review_score": review_score,
+            "keyword_hits": keyword_hits,
+            "expected_keywords": list(expected_keywords),
+            "total_tokens": total_tokens,
+            "latency_ms": total_latency,
+            "needs_human_review": bool(run.review and run.review.needs_human_review),
+        }
+
+    def _build_summary(self, case_results: list[dict[str, Any]]) -> dict[str, Any]:
+        candidate_scores = [case["candidate"]["score"] for case in case_results]
+        baseline_scores = [case["baseline"]["score"] for case in case_results]
+        candidate_tokens = [case["candidate"]["total_tokens"] for case in case_results]
+        baseline_tokens = [case["baseline"]["total_tokens"] for case in case_results]
+        candidate_latency = [case["candidate"]["latency_ms"] for case in case_results]
+        baseline_latency = [case["baseline"]["latency_ms"] for case in case_results]
+        candidate_handoff = [1 if case["candidate"]["needs_human_review"] else 0 for case in case_results]
+        baseline_handoff = [1 if case["baseline"]["needs_human_review"] else 0 for case in case_results]
+        return {
+            "case_count": len(case_results),
+            "candidate_avg_score": round(mean(candidate_scores), 3) if candidate_scores else 0.0,
+            "baseline_avg_score": round(mean(baseline_scores), 3) if baseline_scores else 0.0,
+            "score_delta": round((mean(candidate_scores) - mean(baseline_scores)), 3) if case_results else 0.0,
+            "candidate_avg_tokens": round(mean(candidate_tokens)) if candidate_tokens else 0,
+            "baseline_avg_tokens": round(mean(baseline_tokens)) if baseline_tokens else 0,
+            "candidate_avg_latency_ms": round(mean(candidate_latency)) if candidate_latency else 0,
+            "baseline_avg_latency_ms": round(mean(baseline_latency)) if baseline_latency else 0,
+            "candidate_handoff_rate": round(mean(candidate_handoff) * 100, 1) if candidate_handoff else 0.0,
+            "baseline_handoff_rate": round(mean(baseline_handoff) * 100, 1) if baseline_handoff else 0.0,
+        }

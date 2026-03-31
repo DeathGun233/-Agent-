@@ -7,7 +7,7 @@ WORKFLOW_TEMPLATES = [
     WorkflowTemplate(
         workflow_type=WorkflowType.SALES_FOLLOWUP,
         title="销售分析与跟进计划",
-        description="分析销售漏斗、识别风险客户并生成跟进策略。",
+        description="分析销售漏斗、识别风险客户，并生成可执行的跟进策略。",
         sample_payload={
             "period": "2026-W13",
             "region": "华东",
@@ -18,7 +18,7 @@ WORKFLOW_TEMPLATES = [
     WorkflowTemplate(
         workflow_type=WorkflowType.MARKETING_CAMPAIGN,
         title="营销内容工厂",
-        description="为多个渠道生成内容资产和投放建议。",
+        description="围绕目标产品生成多渠道内容资产、投放角度和审核提示。",
         sample_payload={
             "product_name": "FlowPilot AI 自动化平台",
             "audience": "B2B 企业运营负责人",
@@ -34,7 +34,7 @@ WORKFLOW_TEMPLATES = [
         sample_payload={
             "tickets": [
                 {
-                    "customer": "上海嘉禾医疗",
+                    "customer": "上海嘉祺医疗",
                     "message": "部署后接口连续报错，今天必须恢复，不然影响上线。",
                 },
                 {
@@ -47,7 +47,7 @@ WORKFLOW_TEMPLATES = [
     WorkflowTemplate(
         workflow_type=WorkflowType.MEETING_MINUTES,
         title="会议纪要转执行系统",
-        description="提取负责人、截止时间、待办项和会后邮件。",
+        description="提取负责人、截止时间、待办项和会后同步信息。",
         sample_payload={
             "meeting_title": "AI 增长周会",
             "notes": (

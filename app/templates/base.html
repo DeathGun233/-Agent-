@@ -35,10 +35,10 @@
     }
     a { color: inherit; text-decoration: none; }
     .layout {
-      width: min(1440px, calc(100vw - 28px));
+      width: min(1460px, calc(100vw - 28px));
       margin: 18px auto 28px;
       display: grid;
-      grid-template-columns: 260px minmax(0, 1fr);
+      grid-template-columns: 270px minmax(0, 1fr);
       gap: 16px;
     }
     .sidebar, .surface {
@@ -127,16 +127,9 @@
       line-height: 1.7;
       max-width: 860px;
     }
-    .grid {
-      display: grid;
-      gap: 16px;
-    }
-    .grid.two {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-    .grid.three {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
+    .grid { display: grid; gap: 16px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .metric {
       padding: 16px;
       border: 1px solid var(--line);
@@ -148,10 +141,7 @@
       font-size: 28px;
       margin-bottom: 6px;
     }
-    .card-list {
-      display: grid;
-      gap: 12px;
-    }
+    .card-list { display: grid; gap: 12px; }
     .item-card {
       padding: 16px;
       border: 1px solid var(--line);
@@ -191,7 +181,7 @@
     table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 760px;
+      min-width: 860px;
     }
     th, td {
       padding: 14px 16px;
@@ -206,19 +196,14 @@
       background: rgba(255, 255, 255, 0.74);
     }
     tr:last-child td { border-bottom: 0; }
-    form {
-      display: grid;
-      gap: 12px;
-    }
+    form { display: grid; gap: 12px; }
     label {
       display: grid;
       gap: 8px;
       font-weight: 600;
       font-size: 14px;
     }
-    input, textarea, select, button {
-      font: inherit;
-    }
+    input, textarea, select, button { font: inherit; }
     input, textarea, select {
       width: 100%;
       padding: 12px 14px;
@@ -228,7 +213,7 @@
       color: var(--ink);
     }
     textarea {
-      min-height: 180px;
+      min-height: 140px;
       resize: vertical;
       line-height: 1.6;
     }
@@ -286,7 +271,7 @@
       position: absolute;
       top: 50px;
       transform: translateX(-50%);
-      width: 210px;
+      width: 220px;
     }
     .timeline-dot {
       width: 18px;
@@ -304,14 +289,8 @@
       background: rgba(255, 255, 255, 0.94);
       box-shadow: 0 8px 18px rgba(17, 12, 8, 0.06);
     }
-    .timeline-card strong {
-      display: block;
-      margin-bottom: 6px;
-    }
-    .timeline-card span {
-      font-size: 12px;
-      color: var(--muted);
-    }
+    .timeline-card strong { display: block; margin-bottom: 6px; }
+    .timeline-card span { font-size: 12px; color: var(--muted); }
     .split {
       display: grid;
       gap: 16px;
@@ -330,22 +309,21 @@
       border: 1px solid var(--line);
       background: linear-gradient(135deg, rgba(17, 97, 73, 0.09), rgba(255, 255, 255, 0.86));
     }
+    .compact-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
     @media (max-width: 1080px) {
-      .layout, .split, .grid.two, .grid.three {
-        grid-template-columns: 1fr;
-      }
-      .sidebar {
-        position: static;
-      }
+      .layout, .split, .grid.two, .grid.three { grid-template-columns: 1fr; }
+      .sidebar { position: static; }
       .timeline-node {
         position: static;
         transform: none;
         width: auto;
         margin-top: 12px;
       }
-      .timeline-line {
-        display: none;
-      }
+      .timeline-line { display: none; }
       .timeline-shell {
         padding: 0;
         min-height: 0;
@@ -359,16 +337,18 @@
     <aside class="sidebar">
       <div class="brand">
         <h1>FlowPilot</h1>
-        <p>多 Agent 企业流程工作台，聚焦执行编排、Prompt 实验、多模型对比、人工审核和可观测执行轨迹。</p>
+        <p>多 Agent 企业流程工作台，聚焦任务执行、Prompt 实验、多模型路由、评测对比和人工审核。</p>
       </div>
       <div class="user-card">
         <strong>{{ current_user.display_name }}</strong>
-        <span>@{{ current_user.username }} · {{ current_user.role }}</span>
+        <span>@{{ current_user.username }} / {{ current_user.role }}</span>
       </div>
       <nav class="nav">
         <a href="/dashboard" class="{% if active_page == 'dashboard' %}active{% endif %}">仪表盘</a>
         <a href="/runs" class="{% if active_page == 'runs' %}active{% endif %}">运行历史</a>
         <a href="/compare" class="{% if active_page == 'compare' %}active{% endif %}">模型与 Prompt 对比</a>
+        <a href="/prompts" class="{% if active_page == 'prompts' %}active{% endif %}">Prompt 管理</a>
+        <a href="/evaluations" class="{% if active_page == 'evaluations' %}active{% endif %}">自动评测</a>
         {% if capabilities.can_review %}
         <a href="/reviews" class="{% if active_page == 'reviews' %}active{% endif %}">审核中心</a>
         {% endif %}

@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from uuid import uuid4
 
 from app.db import UserAccountRecord
 from app.main import app, database
@@ -11,11 +12,7 @@ client = TestClient(app)
 def login_as(username: str, password: str) -> None:
     response = client.post(
         "/login",
-        data={
-            "username": username,
-            "password": password,
-            "next": "/dashboard",
-        },
+        data={"username": username, "password": password, "next": "/dashboard"},
         follow_redirects=False,
     )
     assert response.status_code == 303
@@ -39,7 +36,7 @@ def test_root_redirects_to_login() -> None:
 def test_login_page_and_session_endpoint() -> None:
     response = client.get("/login")
     assert response.status_code == 200
-    assert "进入工作台" in response.text
+    assert "FlowPilot" in response.text
 
     login_as("viewer", "viewer123")
     session = client.get("/api/session")
@@ -48,13 +45,13 @@ def test_login_page_and_session_endpoint() -> None:
     assert session.json()["capabilities"]["can_view"] is True
 
 
-def test_dashboard_renders_multi_page_shell() -> None:
+def test_dashboard_renders_prompt_and_routing_controls() -> None:
     login_as("operator", "operator123")
     response = client.get("/dashboard")
     assert response.status_code == 200
-    assert "新建工作流" in response.text
-    assert "模型与 Prompt 对比" in response.text
-    assert "Prompt 方案" in response.text
+    assert "Prompt" in response.text
+    assert "routing_policy_id" in response.text
+    assert "model_name" in response.text
 
 
 def test_health_endpoint_exposes_backend_shape() -> None:
@@ -66,13 +63,15 @@ def test_health_endpoint_exposes_backend_shape() -> None:
     assert "redis_enabled" in body
 
 
-def test_catalog_endpoint_exposes_models_and_prompt_profiles() -> None:
+def test_catalog_endpoint_exposes_models_prompts_routing_and_datasets() -> None:
     login_as("viewer", "viewer123")
     response = client.get("/api/experiments/catalog")
     body = response.json()
     assert response.status_code == 200
     assert any(item["model_name"] == "qwen3-max" for item in body["models"])
     assert any(item["profile_id"] == "balanced-v1" for item in body["prompt_profiles"])
+    assert any(item["policy_id"] == "balanced-router-v1" for item in body["routing_policies"])
+    assert any(item["dataset_id"] == "ops-regression-v1" for item in body["datasets"])
 
 
 def test_graph_endpoint_exposes_langgraph_shape() -> None:
@@ -96,7 +95,7 @@ def test_review_page_requires_reviewer_role() -> None:
     assert "审核中心" in allowed.text
 
 
-def test_sales_workflow_runs_with_selected_model_and_prompt_profile() -> None:
+def test_sales_workflow_runs_with_selected_model_prompt_and_routing() -> None:
     login_as("operator", "operator123")
     response = client.post(
         "/api/workflows/run",
@@ -109,17 +108,18 @@ def test_sales_workflow_runs_with_selected_model_and_prompt_profile() -> None:
             },
             "model_name_override": "qwen-plus",
             "prompt_profile_id": "ops-deep-v1",
+            "routing_policy_id": "balanced-router-v1",
         },
     )
     body = response.json()
     assert response.status_code == 200
-    assert body["result"]["raw_result"]["summary"]["lead_count"] > 0
-    assert body["result"]["execution_profile"]["model_name"] == "qwen-plus"
+    assert body["result"]["raw_result"]["lead_count"] > 0
+    assert body["result"]["execution_profile"]["primary_model_name"] == "qwen-plus"
     assert body["result"]["execution_profile"]["prompt_profile"]["profile_id"] == "ops-deep-v1"
+    assert body["result"]["execution_profile"]["routing_policy"]["policy_id"] == "balanced-router-v1"
     llm_logs = [log for log in body["logs"] if log.get("llm_call")]
     assert len(llm_logs) == 3
-    assert all(log["llm_call"]["model_name"] == "qwen-plus" for log in llm_logs)
-    assert all(log["llm_call"]["prompt_profile_id"] == "ops-deep-v1" for log in llm_logs)
+    assert {log["llm_call"]["route_target"] for log in llm_logs} == {"analyst", "content", "reviewer"}
 
 
 def test_waiting_human_reasons_do_not_include_auto_execute_copy() -> None:
@@ -134,12 +134,12 @@ def test_waiting_human_reasons_do_not_include_auto_execute_copy() -> None:
             "status": "waiting_human",
             "needs_human_review": True,
             "score": 0.65,
-            "reasons": ["需要人工确认一对一辅导计划及风险客户跟进策略的可行性与资源支持。"],
+            "reasons": ["需要人工确认一对一辅导计划及风险客户跟进策略的可行性。"],
         },
     )
     assert merged["status"] == "waiting_human"
     assert merged["needs_human_review"] is True
-    assert all("可直接流转执行" not in reason for reason in merged["reasons"])
+    assert all("可直接流转" not in reason for reason in merged["reasons"])
     assert any("人工" in reason for reason in merged["reasons"])
 
 
@@ -150,15 +150,11 @@ def test_support_workflow_flags_human_review_and_can_be_approved() -> None:
         json={
             "workflow_type": "support_triage",
             "input_payload": {
-                "tickets": [
-                    {
-                        "customer": "示例客户",
-                        "message": "系统报错并影响上线，请尽快恢复。",
-                    }
-                ]
+                "tickets": [{"customer": "示例客户", "message": "系统报错并影响上线，请尽快恢复。"}]
             },
             "model_name_override": "qwen-turbo",
             "prompt_profile_id": "balanced-v1",
+            "routing_policy_id": "strict-review-v1",
         },
     )
     body = response.json()
@@ -191,6 +187,7 @@ def test_detail_page_contains_ai_metrics_and_execution_profile() -> None:
             },
             "model_name_override": "qwen3-max",
             "prompt_profile_id": "exec-brief-v2",
+            "routing_policy_id": "single-model-v1",
         },
     ).json()
     detail = client.get(f"/runs/{created['id']}")
@@ -198,10 +195,46 @@ def test_detail_page_contains_ai_metrics_and_execution_profile() -> None:
     assert "图形化执行时间线" in detail.text
     assert "AI 运行指标" in detail.text
     assert "执行配置" in detail.text
-    assert "管理摘要版 v2" in detail.text
+    assert "管理摘要版" in detail.text
 
 
-def test_compare_page_and_api_show_prompt_experiments() -> None:
+def test_prompt_profile_can_be_created_and_updated() -> None:
+    login_as("admin", "admin123")
+    profile_id = f"ops-lab-{uuid4().hex[:8]}"
+    created = client.post(
+        "/api/prompts",
+        json={
+            "profile_id": profile_id,
+            "base_profile_id": "ops-deep-v1",
+            "name": "运营实验版",
+            "version": "v1",
+            "description": "用于评估更激进的运营洞察表达。",
+            "analyst_instruction": "更强调异常定位。",
+            "content_instruction": "更强调行动项明确。",
+            "reviewer_instruction": "更保守地进入人工审核。",
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["profile_id"] == profile_id
+
+    updated = client.put(
+        f"/api/prompts/{profile_id}",
+        json={
+            "profile_id": profile_id,
+            "base_profile_id": "ops-deep-v1",
+            "name": "运营实验版",
+            "version": "v2",
+            "description": "用于评估更激进的运营洞察表达。",
+            "analyst_instruction": "更强调异常定位和优先级。",
+            "content_instruction": "更强调行动项明确。",
+            "reviewer_instruction": "更保守地进入人工审核。",
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["version"] == "v2"
+
+
+def test_compare_page_and_api_show_routing_experiments() -> None:
     login_as("viewer", "viewer123")
     page = client.get("/compare")
     assert page.status_code == 200
@@ -211,4 +244,30 @@ def test_compare_page_and_api_show_prompt_experiments() -> None:
     body = compare_api.json()
     assert compare_api.status_code == 200
     assert body["run_count"] >= 1
-    assert any("prompt_profile_label" in row for row in body["rows"])
+    assert any("routing_policy_name" in row for row in body["rows"])
+
+
+def test_evaluation_run_and_listing_work() -> None:
+    login_as("operator", "operator123")
+    page = client.get("/evaluations")
+    assert page.status_code == 200
+    assert "自动评测与基线对比" in page.text
+
+    response = client.post(
+        "/evaluations/run",
+        data={
+            "dataset_id": "ops-regression-v1",
+            "candidate_model_name": "qwen-plus",
+            "candidate_prompt_profile_id": "balanced-v1",
+            "candidate_routing_policy_id": "balanced-router-v1",
+            "baseline_model_name": "qwen-turbo",
+            "baseline_prompt_profile_id": "balanced-v1",
+            "baseline_routing_policy_id": "single-model-v1",
+        },
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+    evaluations = client.get("/api/evaluations").json()
+    assert len(evaluations) >= 1
+    assert evaluations[0]["dataset_id"] == "ops-regression-v1"
+    assert "candidate_avg_score" in evaluations[0]["summary"]

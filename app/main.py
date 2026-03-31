@@ -15,10 +15,10 @@ from app.auth import ROLE_ADMIN, ROLE_OPERATOR, ROLE_REVIEWER, AuthService, Auth
 from app.cache import CacheStore
 from app.config import Settings
 from app.db import Database
-from app.models import ReviewSubmission, WorkflowRequest, WorkflowRun, WorkflowType
-from app.prompt_catalog import DEFAULT_PROMPT_PROFILE_ID, resolve_execution_profile
+from app.models import PromptProfileForm, ReviewSubmission, WorkflowRequest, WorkflowRun, WorkflowType
+from app.prompt_catalog import DEFAULT_PROMPT_PROFILE_ID, DEFAULT_ROUTING_POLICY_ID
 from app.repository import WorkflowRepository
-from app.services import WorkflowEngine
+from app.services import EvaluationService, WorkflowEngine
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,9 +27,10 @@ settings = Settings.from_env()
 database = Database(settings.database_url)
 cache = CacheStore(settings.redis_url)
 
-app = FastAPI(title="FlowPilot", version="0.4.0")
+app = FastAPI(title="FlowPilot", version="0.5.0")
 repository = WorkflowRepository(database, cache)
 engine = WorkflowEngine(repository, settings)
+evaluation_service = EvaluationService(repository, engine)
 auth_service = AuthService(settings, database)
 
 
@@ -65,35 +66,30 @@ def _workflow_titles() -> dict[str, str]:
 
 def _extract_execution_profile(run: WorkflowRun) -> dict[str, str]:
     payload = run.result.get("execution_profile") if isinstance(run.result, dict) else None
-    if isinstance(payload, dict):
-        prompt_profile = payload.get("prompt_profile") or {}
+    if not isinstance(payload, dict):
         return {
-            "model_name": payload.get("model_name", settings.model_name),
-            "model_label": payload.get("model_label", payload.get("model_name", settings.model_name)),
-            "prompt_profile_id": prompt_profile.get("profile_id", DEFAULT_PROMPT_PROFILE_ID),
-            "prompt_profile_name": prompt_profile.get("name", "平衡版"),
-            "prompt_profile_version": prompt_profile.get("version", "v1"),
-            "prompt_profile_description": prompt_profile.get("description", ""),
-        }
-    llm_logs = [log for log in run.logs if log.llm_call]
-    if llm_logs:
-        llm_call = llm_logs[0].llm_call
-        return {
-            "model_name": llm_call.model_name,
-            "model_label": llm_call.model_name,
-            "prompt_profile_id": llm_call.prompt_profile_id or DEFAULT_PROMPT_PROFILE_ID,
-            "prompt_profile_name": llm_call.prompt_profile_name or "平衡版",
-            "prompt_profile_version": llm_call.prompt_profile_version or "v1",
+            "primary_model_name": settings.model_name,
+            "primary_model_label": settings.model_name,
+            "prompt_profile_id": DEFAULT_PROMPT_PROFILE_ID,
+            "prompt_profile_name": "平衡版",
+            "prompt_profile_version": "v1",
             "prompt_profile_description": "",
+            "routing_policy_id": DEFAULT_ROUTING_POLICY_ID,
+            "routing_policy_name": "均衡路由",
+            "routing_policy_description": "",
         }
-    resolved = resolve_execution_profile(default_model_name=settings.model_name)
+    prompt_profile = payload.get("prompt_profile") or {}
+    routing_policy = payload.get("routing_policy") or {}
     return {
-        "model_name": resolved.model_name,
-        "model_label": resolved.model_label,
-        "prompt_profile_id": resolved.prompt_profile.profile_id,
-        "prompt_profile_name": resolved.prompt_profile.name,
-        "prompt_profile_version": resolved.prompt_profile.version,
-        "prompt_profile_description": resolved.prompt_profile.description,
+        "primary_model_name": payload.get("primary_model_name", settings.model_name),
+        "primary_model_label": payload.get("primary_model_label", payload.get("primary_model_name", settings.model_name)),
+        "prompt_profile_id": prompt_profile.get("profile_id", DEFAULT_PROMPT_PROFILE_ID),
+        "prompt_profile_name": prompt_profile.get("name", "平衡版"),
+        "prompt_profile_version": prompt_profile.get("version", "v1"),
+        "prompt_profile_description": prompt_profile.get("description", ""),
+        "routing_policy_id": routing_policy.get("policy_id", DEFAULT_ROUTING_POLICY_ID),
+        "routing_policy_name": routing_policy.get("name", "均衡路由"),
+        "routing_policy_description": routing_policy.get("description", ""),
     }
 
 
@@ -153,9 +149,9 @@ def _build_run_table(runs: list[WorkflowRun]) -> list[dict]:
                 "review_score": f"{run.review.score:.2f}" if run.review else "--",
                 "updated_at": run.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                 "created_at": run.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
-                "model_name": execution_profile["model_name"],
+                "model_name": execution_profile["primary_model_name"],
                 "prompt_profile_label": f"{execution_profile['prompt_profile_name']} {execution_profile['prompt_profile_version']}",
-                "prompt_profile_id": execution_profile["prompt_profile_id"],
+                "routing_policy_name": execution_profile["routing_policy_name"],
             }
         )
     return rows
@@ -167,7 +163,9 @@ def _build_llm_summary(run: WorkflowRun) -> dict[str, object]:
         return {
             "total_requests": 0,
             "model_names": [],
+            "route_targets": [],
             "prompt_profiles": [],
+            "routing_policies": [],
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "total_tokens": 0,
@@ -176,16 +174,12 @@ def _build_llm_summary(run: WorkflowRun) -> dict[str, object]:
             "fallback_requests": 0,
         }
     total_latency_ms = sum(call.latency_ms for call in llm_calls)
-    prompt_profiles = sorted(
-        {
-            f"{call.prompt_profile_name or '平衡版'} {call.prompt_profile_version or 'v1'}"
-            for call in llm_calls
-        }
-    )
     return {
         "total_requests": len(llm_calls),
         "model_names": sorted({call.model_name for call in llm_calls}),
-        "prompt_profiles": prompt_profiles,
+        "route_targets": sorted({call.route_target for call in llm_calls}),
+        "prompt_profiles": sorted({f"{call.prompt_profile_name} {call.prompt_profile_version}" for call in llm_calls}),
+        "routing_policies": sorted({call.routing_policy_name or "" for call in llm_calls}),
         "prompt_tokens": sum(call.prompt_tokens for call in llm_calls),
         "completion_tokens": sum(call.completion_tokens for call in llm_calls),
         "total_tokens": sum(call.total_tokens for call in llm_calls),
@@ -196,14 +190,21 @@ def _build_llm_summary(run: WorkflowRun) -> dict[str, object]:
 
 
 def _build_compare_summary(runs: list[WorkflowRun]) -> dict[str, object]:
-    grouped: dict[tuple[str, str, str], list[WorkflowRun]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str], list[WorkflowRun]] = defaultdict(list)
     for run in runs:
         profile = _extract_execution_profile(run)
-        grouped[(run.workflow_type.value, profile["model_name"], profile["prompt_profile_id"])].append(run)
+        grouped[
+            (
+                run.workflow_type.value,
+                profile["primary_model_name"],
+                profile["prompt_profile_id"],
+                profile["routing_policy_id"],
+            )
+        ].append(run)
 
     titles = _workflow_titles()
     rows = []
-    for (workflow_type, model_name, prompt_profile_id), group_runs in grouped.items():
+    for (workflow_type, model_name, prompt_profile_id, routing_policy_id), group_runs in grouped.items():
         scores = [run.review.score for run in group_runs if run.review]
         llm_calls = [log.llm_call for run in group_runs for log in run.logs if log.llm_call]
         profile = _extract_execution_profile(group_runs[0])
@@ -212,10 +213,11 @@ def _build_compare_summary(runs: list[WorkflowRun]) -> dict[str, object]:
         rows.append(
             {
                 "workflow_title": titles.get(workflow_type, workflow_type),
-                "workflow_type": workflow_type,
                 "model_name": model_name,
                 "prompt_profile_id": prompt_profile_id,
                 "prompt_profile_label": f"{profile['prompt_profile_name']} {profile['prompt_profile_version']}",
+                "routing_policy_id": routing_policy_id,
+                "routing_policy_name": profile["routing_policy_name"],
                 "run_count": len(group_runs),
                 "avg_score": round(mean(scores), 2) if scores else 0.0,
                 "avg_tokens": round(mean(call.total_tokens for call in llm_calls)) if llm_calls else 0,
@@ -225,14 +227,14 @@ def _build_compare_summary(runs: list[WorkflowRun]) -> dict[str, object]:
                 "latest_run_at": max(_normalized_datetime(run.updated_at) for run in group_runs).astimezone().strftime("%Y-%m-%d %H:%M:%S"),
             }
         )
-
-    rows.sort(key=lambda item: (-item["run_count"], item["workflow_type"], item["model_name"], item["prompt_profile_id"]))
+    rows.sort(key=lambda item: (-item["run_count"], item["workflow_title"], item["model_name"]))
     return {
         "rows": rows,
         "combination_count": len(rows),
         "run_count": len(runs),
         "model_count": len({row["model_name"] for row in rows}),
         "prompt_count": len({row["prompt_profile_id"] for row in rows}),
+        "routing_count": len({row["routing_policy_id"] for row in rows}),
     }
 
 
@@ -258,15 +260,7 @@ def login_page(request: Request, next: str = "/dashboard"):
     user = auth_service.get_user_from_request(request)
     if user is not None:
         return RedirectResponse(url=_safe_next_path(next), status_code=303)
-    return _template_response(
-        request,
-        "login.html",
-        {
-            "request": request,
-            "next": _safe_next_path(next),
-            "error": "",
-        },
-    )
+    return _template_response(request, "login.html", {"request": request, "next": _safe_next_path(next), "error": ""})
 
 
 @app.post("/login", response_class=HTMLResponse)
@@ -282,11 +276,7 @@ def login_action(
         return _template_response(
             request,
             "login.html",
-            {
-                "request": request,
-                "next": safe_next,
-                "error": "用户名或密码错误，请重试。",
-            },
+            {"request": request, "next": safe_next, "error": "用户名或密码错误，请重试。"},
             status_code=401,
         )
     response = RedirectResponse(url=safe_next, status_code=303)
@@ -324,8 +314,10 @@ def dashboard_page(request: Request):
             templates_data=engine.list_templates(),
             model_options=engine.list_model_options(),
             prompt_profiles=engine.list_prompt_profiles(),
+            routing_policies=engine.list_routing_policies(),
             default_model_name=settings.model_name,
             default_prompt_profile_id=DEFAULT_PROMPT_PROFILE_ID,
+            default_routing_policy_id=DEFAULT_ROUTING_POLICY_ID,
             recent_runs=_build_run_table(runs[:6]),
             summary=_summarize_runs(runs),
             review_queue=_build_run_table(queue[:5]),
@@ -341,6 +333,7 @@ def dashboard_run_action(
     payload_json: str = Form("{}"),
     selected_model_name: str = Form(settings.model_name, alias="model_name"),
     prompt_profile_id: str = Form(DEFAULT_PROMPT_PROFILE_ID),
+    routing_policy_id: str = Form(DEFAULT_ROUTING_POLICY_ID),
 ) -> RedirectResponse:
     user = _page_user(request, {ROLE_OPERATOR, ROLE_ADMIN})
     if user is None:
@@ -355,6 +348,7 @@ def dashboard_run_action(
             input_payload=payload,
             model_name_override=selected_model_name,
             prompt_profile_id=prompt_profile_id,
+            routing_policy_id=routing_policy_id,
         )
     )
     return RedirectResponse(url=f"/runs/{run.id}", status_code=303)
@@ -369,13 +363,7 @@ def runs_page(request: Request):
     return _template_response(
         request,
         "runs.html",
-        _common_context(
-            request,
-            user,
-            "runs",
-            runs=_build_run_table(runs),
-            summary=_summarize_runs(runs),
-        ),
+        _common_context(request, user, "runs", runs=_build_run_table(runs), summary=_summarize_runs(runs)),
     )
 
 
@@ -385,7 +373,6 @@ def compare_page(request: Request):
     if user is None:
         return _redirect_to_login(request)
     runs = engine.list_runs()
-    compare_summary = _build_compare_summary(runs)
     return _template_response(
         request,
         "compare.html",
@@ -393,12 +380,147 @@ def compare_page(request: Request):
             request,
             user,
             "compare",
-            compare_summary=compare_summary,
+            compare_summary=_build_compare_summary(runs),
             model_options=engine.list_model_options(),
             prompt_profiles=engine.list_prompt_profiles(),
+            routing_policies=engine.list_routing_policies(),
             latest_runs=_build_run_table(runs[:8]),
         ),
     )
+
+
+@app.get("/prompts", response_class=HTMLResponse)
+def prompts_page(request: Request):
+    user = _page_user(request)
+    if user is None:
+        return _redirect_to_login(request)
+    return _template_response(
+        request,
+        "prompts.html",
+        _common_context(
+            request,
+            user,
+            "prompts",
+            prompt_profiles=engine.list_prompt_profiles(),
+        ),
+    )
+
+
+@app.post("/prompts/create")
+def prompt_create_action(
+    request: Request,
+    profile_id: str = Form(...),
+    base_profile_id: str = Form(""),
+    name: str = Form(...),
+    version: str = Form(...),
+    description: str = Form(...),
+    analyst_instruction: str = Form(...),
+    content_instruction: str = Form(...),
+    reviewer_instruction: str = Form(...),
+) -> RedirectResponse:
+    user = _page_user(request, {ROLE_ADMIN})
+    if user is None:
+        return _redirect_to_login(request)
+    engine.create_prompt_profile(
+        PromptProfileForm(
+            profile_id=profile_id,
+            base_profile_id=base_profile_id or None,
+            name=name,
+            version=version,
+            description=description,
+            analyst_instruction=analyst_instruction,
+            content_instruction=content_instruction,
+            reviewer_instruction=reviewer_instruction,
+        )
+    )
+    return RedirectResponse(url="/prompts", status_code=303)
+
+
+@app.post("/prompts/{profile_id}/update")
+def prompt_update_action(
+    profile_id: str,
+    request: Request,
+    base_profile_id: str = Form(""),
+    name: str = Form(...),
+    version: str = Form(...),
+    description: str = Form(...),
+    analyst_instruction: str = Form(...),
+    content_instruction: str = Form(...),
+    reviewer_instruction: str = Form(...),
+) -> RedirectResponse:
+    user = _page_user(request, {ROLE_ADMIN})
+    if user is None:
+        return _redirect_to_login(request)
+    engine.update_prompt_profile(
+        profile_id,
+        PromptProfileForm(
+            profile_id=profile_id,
+            base_profile_id=base_profile_id or None,
+            name=name,
+            version=version,
+            description=description,
+            analyst_instruction=analyst_instruction,
+            content_instruction=content_instruction,
+            reviewer_instruction=reviewer_instruction,
+        ),
+    )
+    return RedirectResponse(url="/prompts", status_code=303)
+
+
+@app.get("/evaluations", response_class=HTMLResponse)
+def evaluations_page(request: Request):
+    user = _page_user(request)
+    if user is None:
+        return _redirect_to_login(request)
+    return _template_response(
+        request,
+        "evaluations.html",
+        _common_context(
+            request,
+            user,
+            "evaluations",
+            datasets=evaluation_service.list_datasets(),
+            model_options=engine.list_model_options(),
+            prompt_profiles=engine.list_prompt_profiles(),
+            routing_policies=engine.list_routing_policies(),
+            default_model_name=settings.model_name,
+            default_prompt_profile_id=DEFAULT_PROMPT_PROFILE_ID,
+            default_routing_policy_id=DEFAULT_ROUTING_POLICY_ID,
+            evaluations=evaluation_service.list_evaluations(),
+        ),
+    )
+
+
+@app.post("/evaluations/run")
+def evaluation_run_action(
+    request: Request,
+    dataset_id: str = Form(...),
+    candidate_model_name: str = Form(...),
+    candidate_prompt_profile_id: str = Form(...),
+    candidate_routing_policy_id: str = Form(...),
+    baseline_model_name: str = Form(...),
+    baseline_prompt_profile_id: str = Form(...),
+    baseline_routing_policy_id: str = Form(...),
+) -> RedirectResponse:
+    user = _page_user(request, {ROLE_OPERATOR, ROLE_ADMIN})
+    if user is None:
+        return _redirect_to_login(request)
+    evaluation = evaluation_service.run_evaluation(
+        dataset_id=dataset_id,
+        candidate_request=WorkflowRequest(
+            workflow_type=WorkflowType.SALES_FOLLOWUP,
+            model_name_override=candidate_model_name,
+            prompt_profile_id=candidate_prompt_profile_id,
+            routing_policy_id=candidate_routing_policy_id,
+        ),
+        baseline_request=WorkflowRequest(
+            workflow_type=WorkflowType.SALES_FOLLOWUP,
+            model_name_override=baseline_model_name,
+            prompt_profile_id=baseline_prompt_profile_id,
+            routing_policy_id=baseline_routing_policy_id,
+        ),
+    )
+    return RedirectResponse(url=f"/evaluations?selected={evaluation.id}", status_code=303)
 
 
 @app.get("/reviews", response_class=HTMLResponse)
@@ -406,16 +528,10 @@ def reviews_page(request: Request):
     user = _page_user(request, {ROLE_REVIEWER, ROLE_ADMIN})
     if user is None:
         return _redirect_to_login(request)
-    queue = engine.list_review_queue()
     return _template_response(
         request,
         "reviews.html",
-        _common_context(
-            request,
-            user,
-            "reviews",
-            queue=_build_run_table(queue),
-        ),
+        _common_context(request, user, "reviews", queue=_build_run_table(engine.list_review_queue())),
     )
 
 
@@ -427,7 +543,6 @@ def run_detail_page(run_id: str, request: Request):
     run = engine.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="workflow run not found")
-    execution_profile = _extract_execution_profile(run)
     return _template_response(
         request,
         "run_detail.html",
@@ -436,7 +551,7 @@ def run_detail_page(run_id: str, request: Request):
             user,
             "runs",
             run=run,
-            execution_profile=execution_profile,
+            execution_profile=_extract_execution_profile(run),
             run_result_json=json.dumps(run.result, ensure_ascii=False, indent=2),
             run_view={
                 "title": _workflow_titles().get(run.workflow_type.value, run.workflow_type.value),
@@ -461,12 +576,7 @@ def review_form_action(
     user = _page_user(request, {ROLE_REVIEWER, ROLE_ADMIN})
     if user is None:
         return _redirect_to_login(request)
-    run = engine.submit_review(
-        run_id,
-        approve=decision == "approve",
-        comment=comment,
-        reviewer_name=user.display_name,
-    )
+    run = engine.submit_review(run_id, approve=decision == "approve", comment=comment, reviewer_name=user.display_name)
     if run is None:
         raise HTTPException(status_code=404, detail="workflow run not found")
     target = "/reviews" if next_page == "reviews" else f"/runs/{run_id}"
@@ -508,9 +618,12 @@ def experiment_catalog(request: Request) -> dict[str, object]:
     auth_service.require_user(request)
     return {
         "models": engine.list_model_options(),
-        "prompt_profiles": engine.list_prompt_profiles(),
+        "prompt_profiles": [item.model_dump(mode="json") for item in engine.list_prompt_profiles()],
+        "routing_policies": engine.list_routing_policies(),
+        "datasets": evaluation_service.list_datasets(),
         "default_model_name": settings.model_name,
         "default_prompt_profile_id": DEFAULT_PROMPT_PROFILE_ID,
+        "default_routing_policy_id": DEFAULT_ROUTING_POLICY_ID,
     }
 
 
@@ -561,3 +674,36 @@ def submit_review(run_id: str, request: Request, submission: ReviewSubmission) -
     if run is None:
         raise HTTPException(status_code=404, detail="workflow run not found")
     return run.model_dump(mode="json")
+
+
+@app.get("/api/prompts")
+def list_prompt_profiles(request: Request) -> list[dict]:
+    auth_service.require_user(request)
+    return [item.model_dump(mode="json") for item in engine.list_prompt_profiles()]
+
+
+@app.post("/api/prompts")
+def create_prompt_profile(request: Request, body: PromptProfileForm) -> dict:
+    auth_service.require_roles(request, ROLE_ADMIN)
+    return engine.create_prompt_profile(body).model_dump(mode="json")
+
+
+@app.put("/api/prompts/{profile_id}")
+def update_prompt_profile(profile_id: str, request: Request, body: PromptProfileForm) -> dict:
+    auth_service.require_roles(request, ROLE_ADMIN)
+    return engine.update_prompt_profile(profile_id, body).model_dump(mode="json")
+
+
+@app.get("/api/evaluations")
+def list_evaluations(request: Request) -> list[dict]:
+    auth_service.require_user(request)
+    return [item.model_dump(mode="json") for item in evaluation_service.list_evaluations()]
+
+
+@app.get("/api/evaluations/{evaluation_id}")
+def get_evaluation(evaluation_id: str, request: Request) -> dict:
+    auth_service.require_user(request)
+    evaluation = evaluation_service.get_evaluation(evaluation_id)
+    if evaluation is None:
+        raise HTTPException(status_code=404, detail="evaluation not found")
+    return evaluation.model_dump(mode="json")

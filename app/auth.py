@@ -6,7 +6,6 @@ import hmac
 import json
 import secrets
 from dataclasses import dataclass
-from typing import Any
 
 from fastapi import HTTPException, Request, status
 from sqlalchemy import select
@@ -62,28 +61,21 @@ class AuthService:
                 for record in session.scalars(select(UserAccountRecord)).all()
             }
             for seed in seeds:
-                if seed.username in existing:
-                    record = existing[seed.username]
-                    changed = False
-                    if record.display_name != seed.display_name:
-                        record.display_name = seed.display_name
-                        changed = True
-                    if record.role != seed.role:
-                        record.role = seed.role
-                        changed = True
-                    if not record.is_active:
-                        record.is_active = True
-                        changed = True
-                    continue
-                session.add(
-                    UserAccountRecord(
-                        username=seed.username,
-                        password_hash=self.hash_password(seed.password),
-                        display_name=seed.display_name,
-                        role=seed.role,
-                        is_active=True,
+                record = existing.get(seed.username)
+                if record is None:
+                    session.add(
+                        UserAccountRecord(
+                            username=seed.username,
+                            password_hash=self.hash_password(seed.password),
+                            display_name=seed.display_name,
+                            role=seed.role,
+                            is_active=True,
+                        )
                     )
-                )
+                    continue
+                record.display_name = seed.display_name
+                record.role = seed.role
+                record.is_active = True
 
     def authenticate(self, username: str, password: str) -> AuthUser | None:
         record = self._get_user_record(username.strip())
@@ -158,15 +150,15 @@ class AuthService:
 
     @staticmethod
     def verify_password(password: str, stored_password: str) -> bool:
-        if stored_password.startswith(f"{PBKDF2_PREFIX}$"):
-            try:
-                _, rounds_text, salt, stored_digest = stored_password.split("$", 3)
-                rounds = int(rounds_text)
-            except ValueError:
-                return False
-            candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), rounds).hex()
-            return hmac.compare_digest(candidate, stored_digest)
-        return hmac.compare_digest(password, stored_password)
+        if not stored_password.startswith(f"{PBKDF2_PREFIX}$"):
+            return hmac.compare_digest(password, stored_password)
+        try:
+            _, rounds_text, salt, stored_digest = stored_password.split("$", 3)
+            rounds = int(rounds_text)
+        except ValueError:
+            return False
+        candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), rounds).hex()
+        return hmac.compare_digest(candidate, stored_digest)
 
     def _get_user_record(self, username: str | None) -> UserAccountRecord | None:
         if not username:
