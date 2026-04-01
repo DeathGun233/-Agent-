@@ -38,10 +38,15 @@
   <h2>执行时间线</h2>
   <div class="timeline">
     {% for point in timeline %}
-    <div class="timeline-point" style="left: {{ point.left }}%;">
+    <div class="timeline-point {{ point.lane }}" style="left: {{ point.left }}%;">
       <div class="timeline-dot"></div>
-      <strong>{{ point.agent }}</strong>
-      <div class="subtle">{{ point.timestamp }}</div>
+      <div class="timeline-card">
+        <div class="timeline-agent">{{ point.agent }}</div>
+        <div class="timeline-meta">{{ point.timestamp }} · 耗时 {{ point.duration }}</div>
+        {% if point.tool_name %}
+        <div class="timeline-tool"><span class="badge">{{ point.tool_name }}</span></div>
+        {% endif %}
+      </div>
     </div>
     {% endfor %}
   </div>

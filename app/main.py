@@ -139,7 +139,13 @@ def _build_timeline(run: WorkflowRun) -> list[dict]:
     count = len(run.logs)
     for index, log in enumerate(run.logs):
         offset_seconds = max((log.timestamp - run.created_at).total_seconds(), 0)
-        left = 50 if count == 1 else round((offset_seconds / total_seconds) * 100, 2)
+        if count == 1:
+            left = 50.0
+        else:
+            time_left = (offset_seconds / total_seconds) * 100
+            even_left = 6 + (index / max(count - 1, 1)) * 88
+            # Blend uniform spacing with elapsed time so same-second steps do not overlap.
+            left = round(even_left * 0.8 + time_left * 0.2, 2)
         next_timestamp = run.logs[index + 1].timestamp if index + 1 < count else run.updated_at
         duration_seconds = max((next_timestamp - log.timestamp).total_seconds(), 0)
         points.append(
@@ -151,6 +157,7 @@ def _build_timeline(run: WorkflowRun) -> list[dict]:
                 "left": min(max(left, 2), 98),
                 "duration": f"{duration_seconds:.2f}s",
                 "tool_name": log.tool_call.name if log.tool_call else "",
+                "lane": "top" if index % 2 == 0 else "bottom",
             }
         )
     return points
