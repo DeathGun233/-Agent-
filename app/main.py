@@ -349,6 +349,17 @@ def run_detail_page(run_id: str, request: Request):
     )
 
 
+@app.post("/runs/{run_id}/delete")
+def delete_run_form(run_id: str, request: Request):
+    user = _page_user(request, {ROLE_OPERATOR, ROLE_REVIEWER, ROLE_ADMIN})
+    if user is None:
+        return _redirect_to_login(request)
+    deleted = engine.delete_run(run_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="workflow run not found")
+    return RedirectResponse(url="/runs", status_code=303)
+
+
 @app.get("/reviews", response_class=HTMLResponse)
 def reviews_page(request: Request):
     user = _page_user(request, {ROLE_REVIEWER, ROLE_ADMIN})
@@ -489,6 +500,15 @@ def run_workflow(request: Request, payload: WorkflowRequest):
 def list_workflows(request: Request):
     auth_service.require_user(request)
     return [run.model_dump(mode="json") for run in engine.list_runs()]
+
+
+@app.delete("/api/workflows/{run_id}")
+def delete_workflow(run_id: str, request: Request):
+    auth_service.require_roles(request, ROLE_OPERATOR, ROLE_REVIEWER, ROLE_ADMIN)
+    deleted = engine.delete_run(run_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="workflow run not found")
+    return {"ok": True, "run_id": run_id}
 
 
 @app.get("/api/workflows/review-queue")

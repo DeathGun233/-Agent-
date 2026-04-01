@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.cache import CacheStore
 from app.db import (
@@ -79,6 +79,21 @@ class WorkflowRepository:
                 .order_by(WorkflowRunRecord.updated_at.desc())
             ).all()
         return [self._deserialize_run(record) for record in records]
+
+    def delete_run(self, run_id: str) -> bool:
+        deleted = False
+        with self.database.session() as session:
+            record = session.get(WorkflowRunRecord, run_id)
+            if record is None:
+                return False
+            session.execute(
+                delete(FeedbackSampleRecord).where(FeedbackSampleRecord.source_run_id == run_id)
+            )
+            session.delete(record)
+            deleted = True
+        if deleted and self.cache:
+            self.cache.set_json(f"workflow_run:{run_id}", {})
+        return deleted
 
     def save_prompt_profile(self, prompt_profile: PromptProfile) -> PromptProfile:
         with self.database.session() as session:

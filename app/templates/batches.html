@@ -3,7 +3,7 @@
 <div class="header">
   <div>
     <h1>批量实验</h1>
-    <p>一次性跑多个模型与 Prompt 变体，并按得分、成本、时延和接管率自动排序。</p>
+    <p>一次运行多个模型与 Prompt 变体，并自动按表现排序，标记冠军方案。</p>
   </div>
 </div>
 
@@ -52,33 +52,30 @@
         <strong>{{ batch.name }}</strong>
         <div class="subtle">{{ workflow_label(batch.workflow_type.value) }} · 共 {{ batch.summary.run_count }} 次运行</div>
         {% if batch.summary.champion %}
-        <div class="badge">冠军方案：{{ batch.summary.champion.variant_label }}</div>
-        <div class="subtle">{{ batch.summary.champion.reason }}</div>
+        <div class="card" style="margin-top:12px;border-color:rgba(182,76,45,.3);background:rgba(182,76,45,.08);">
+          <strong>冠军方案：{{ batch.summary.champion.variant_label }}</strong>
+          <div class="subtle">平均分 {{ batch.summary.champion.avg_score }} · 平均成本 ${{ batch.summary.champion.avg_cost_usd }} · 平均时延 {{ batch.summary.champion.avg_latency_ms }} 毫秒</div>
+          <div class="subtle">{{ batch.summary.champion.reason }}</div>
+        </div>
         {% endif %}
-        <table style="margin-top:12px;">
-          <thead>
-            <tr>
-              <th>排名</th>
-              <th>方案</th>
-              <th>平均分</th>
-              <th>平均成本</th>
-              <th>平均时延</th>
-              <th>接管率</th>
-            </tr>
-          </thead>
-          <tbody>
-            {% for row in batch.summary.rows %}
-            <tr>
-              <td>{% if row.is_champion %}冠军{% else %}第 {{ row.rank }} 名{% endif %}</td>
-              <td>{{ row.variant_label }}</td>
-              <td>{{ row.avg_score }}</td>
-              <td>${{ row.avg_cost_usd }}</td>
-              <td>{{ row.avg_latency_ms }} 毫秒</td>
-              <td>{{ row.handoff_rate }}%</td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
+        <div class="stack" style="margin-top:12px;">
+          {% set max_score = (batch.summary.rows | map(attribute='avg_score') | max) if batch.summary.rows else 1 %}
+          {% for row in batch.summary.rows %}
+          <div class="card">
+            <div style="display:flex;justify-content:space-between;gap:12px;align-items:center;">
+              <strong>{% if row.is_champion %}冠军 · {% else %}第 {{ row.rank }} 名 · {% endif %}{{ row.variant_label }}</strong>
+              <span class="badge">平均分 {{ row.avg_score }}</span>
+            </div>
+            <div style="height:12px;border-radius:999px;background:rgba(0,0,0,.06);overflow:hidden;margin-top:10px;">
+              <div style="height:100%;width:{{ (row.avg_score / max_score * 100) if max_score else 0 }}%;background:linear-gradient(90deg,#1d1b18,#b64c2d);"></div>
+            </div>
+            <div class="subtle" style="margin-top:8px;">模型 {{ row.model_name }} · 平均成本 ${{ row.avg_cost_usd }} · 平均时延 {{ row.avg_latency_ms }} 毫秒 · 接管率 {{ row.handoff_rate }}%</div>
+            {% if row.champion_reason %}
+            <div class="subtle">{{ row.champion_reason }}</div>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
       </div>
       {% else %}
       <div class="subtle">当前还没有批量实验记录。</div>

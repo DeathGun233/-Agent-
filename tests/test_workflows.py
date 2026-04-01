@@ -279,6 +279,7 @@ def test_cost_summary_page_and_api_work() -> None:
     page = client.get("/costs")
     assert page.status_code == 200
     assert "成本看板" in page.text
+    assert "预算进度" in page.text
 
     summary = client.get("/api/costs/summary")
     body = summary.json()
@@ -330,6 +331,9 @@ def test_batch_experiment_run_and_listing_work() -> None:
 
     listing = client.get("/api/batches").json()
     assert any(item["id"] == body["id"] for item in listing)
+    page = client.get("/batches")
+    assert page.status_code == 200
+    assert "冠军方案" in page.text
 
 
 def test_feedback_review_creates_feedback_sample_and_feedback_dataset() -> None:
@@ -362,3 +366,38 @@ def test_feedback_review_creates_feedback_sample_and_feedback_dataset() -> None:
 
     catalog = client.get("/api/experiments/catalog").json()
     assert any(item["dataset_id"] == "feedback-loop-v1" for item in catalog["datasets"])
+
+
+def test_run_can_be_deleted_and_related_feedback_samples_are_removed() -> None:
+    login_as("operator", "operator123")
+    created = client.post(
+        "/api/workflows/run",
+        json={
+            "workflow_type": "support_triage",
+            "input_payload": {
+                "tickets": [{"customer": "删除测试客户", "message": "生产系统报错，需要尽快处理。"}]
+            },
+            "model_name_override": "qwen-turbo",
+            "prompt_profile_id": "balanced-v1",
+            "routing_policy_id": "strict-review-v1",
+        },
+    ).json()
+
+    login_as("reviewer", "reviewer123")
+    reviewed = client.post(
+        f"/api/workflows/{created['id']}/review",
+        json={"approve": True, "comment": "删除前先沉淀一条反馈样本。"},
+    )
+    assert reviewed.status_code == 200
+
+    feedback_samples = client.get("/api/feedback-samples").json()
+    assert any(item["source_run_id"] == created["id"] for item in feedback_samples)
+
+    deleted = client.delete(f"/api/workflows/{created['id']}")
+    assert deleted.status_code == 200
+    assert deleted.json()["ok"] is True
+
+    workflows = client.get("/api/workflows").json()
+    assert all(item["id"] != created["id"] for item in workflows)
+    feedback_samples_after = client.get("/api/feedback-samples").json()
+    assert all(item["source_run_id"] != created["id"] for item in feedback_samples_after)

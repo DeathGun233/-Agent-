@@ -5,9 +5,14 @@
     <h1>{{ workflow_label(run.workflow_type.value) }}</h1>
     <p>{{ run.objective }}</p>
   </div>
-  <div>
+  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
     <span class="badge status-{{ run.status.value }}">{{ status_label(run.status.value) }}</span>
     {% if run.review %}<span class="badge">评分={{ "%.2f"|format(run.review.score) }}</span>{% endif %}
+    {% if capabilities.can_run or capabilities.can_review or capabilities.can_admin %}
+    <form method="post" action="/runs/{{ run.id }}/delete" onsubmit="return confirm('确认删除这条工作流及其反馈样本吗？');" style="margin:0;">
+      <button type="submit" class="secondary">删除该工作流</button>
+    </form>
+    {% endif %}
   </div>
 </div>
 

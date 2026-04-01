@@ -3,7 +3,7 @@
 <div class="header">
   <div>
     <h1>成本看板</h1>
-    <p>按月查看模型消耗、预算进度、阈值预警和模型成本分布。</p>
+    <p>按月查看模型消耗、预算进度、阈值预警和成本趋势。</p>
   </div>
 </div>
 
@@ -14,6 +14,12 @@
     {% for item in summary.thresholds %}
     <span class="badge">{{ item.label }} {{ item.ratio_percent }}%</span>
     {% endfor %}
+  </div>
+  <div style="margin-top:14px;">
+    <div class="subtle">预算进度</div>
+    <div style="height:12px;border-radius:999px;background:rgba(0,0,0,.06);overflow:hidden;margin-top:8px;">
+      <div style="height:100%;width:{{ [summary.spend_ratio_percent, 100]|min }}%;background:linear-gradient(90deg,#b64c2d,#d38f54);"></div>
+    </div>
   </div>
 </section>
 
@@ -38,39 +44,38 @@
 <div class="grid two" style="margin-top:18px;">
   <section class="card">
     <h2>模型成本分布</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>模型</th>
-          <th>调用次数</th>
-          <th>成本</th>
-          <th>Tokens</th>
-          <th>平均时延</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for row in summary.model_rows %}
-        <tr>
-          <td>{{ row.model_name }}</td>
-          <td>{{ row.requests }}</td>
-          <td>${{ row.cost_usd }}</td>
-          <td>{{ row.tokens }}</td>
-          <td>{{ row.avg_latency_ms }} 毫秒</td>
-        </tr>
-        {% else %}
-        <tr><td colspan="5" class="subtle">本月还没有模型调用记录。</td></tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="stack">
+      {% set max_model_cost = summary.model_rows[0].cost_usd if summary.model_rows else 1 %}
+      {% for row in summary.model_rows %}
+      <div>
+        <div style="display:flex;justify-content:space-between;gap:12px;">
+          <strong>{{ row.model_name }}</strong>
+          <span class="subtle">${{ row.cost_usd }} · {{ row.requests }} 次</span>
+        </div>
+        <div style="height:12px;border-radius:999px;background:rgba(0,0,0,.06);overflow:hidden;margin-top:8px;">
+          <div style="height:100%;width:{{ (row.cost_usd / max_model_cost * 100) if max_model_cost else 0 }}%;background:linear-gradient(90deg,#1d1b18,#b64c2d);"></div>
+        </div>
+        <div class="subtle" style="margin-top:6px;">Tokens：{{ row.tokens }} · 平均时延：{{ row.avg_latency_ms }} 毫秒</div>
+      </div>
+      {% else %}
+      <div class="subtle">本月还没有模型调用记录。</div>
+      {% endfor %}
+    </div>
   </section>
 
   <section class="card">
-    <h2>每日成本</h2>
+    <h2>每日成本趋势</h2>
     <div class="stack">
+      {% set max_daily_cost = (summary.daily_cost_rows | map(attribute='cost_usd') | max) if summary.daily_cost_rows else 1 %}
       {% for row in summary.daily_cost_rows %}
-      <div class="card">
-        <strong>{{ row.day }}</strong>
-        <div class="subtle">${{ row.cost_usd }}</div>
+      <div>
+        <div style="display:flex;justify-content:space-between;gap:12px;">
+          <strong>{{ row.day }}</strong>
+          <span class="subtle">${{ row.cost_usd }}</span>
+        </div>
+        <div style="height:12px;border-radius:999px;background:rgba(0,0,0,.06);overflow:hidden;margin-top:8px;">
+          <div style="height:100%;width:{{ (row.cost_usd / max_daily_cost * 100) if max_daily_cost else 0 }}%;background:linear-gradient(90deg,#d7a45a,#b64c2d);"></div>
+        </div>
       </div>
       {% else %}
       <div class="subtle">本月还没有成本数据。</div>

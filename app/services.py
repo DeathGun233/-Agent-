@@ -707,6 +707,9 @@ class WorkflowEngine:
     def list_waiting_human(self) -> list[WorkflowRun]:
         return self.repository.list_waiting_human()
 
+    def delete_run(self, run_id: str) -> bool:
+        return self.repository.delete_run(run_id)
+
     def create_prompt_profile(self, form: PromptProfileForm) -> PromptProfile:
         return self.prompt_profiles.create_profile(form)
 

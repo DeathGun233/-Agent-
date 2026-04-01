@@ -3,7 +3,7 @@
 <div class="header">
   <div>
     <h1>运行历史</h1>
-    <p>查看每个工作流实例的状态、执行配置和最新更新时间。</p>
+    <p>查看所有工作流实例，并在误创建时直接删除无效记录。</p>
   </div>
 </div>
 
@@ -17,6 +17,7 @@
         <th>Prompt</th>
         <th>路由策略</th>
         <th>更新时间</th>
+        <th>操作</th>
       </tr>
     </thead>
     <tbody>
@@ -28,9 +29,19 @@
         <td>{{ row.prompt_profile_label }}</td>
         <td>{{ row.routing_policy_name }}</td>
         <td>{{ row.updated_at }}</td>
+        <td>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <a class="badge" href="/runs/{{ row.id }}">查看</a>
+            {% if capabilities.can_run or capabilities.can_review or capabilities.can_admin %}
+            <form method="post" action="/runs/{{ row.id }}/delete" onsubmit="return confirm('确认删除这条工作流记录吗？');" style="margin:0;">
+              <button type="submit" class="secondary">删除</button>
+            </form>
+            {% endif %}
+          </div>
+        </td>
       </tr>
       {% else %}
-      <tr><td colspan="6" class="subtle">还没有运行记录。</td></tr>
+      <tr><td colspan="7" class="subtle">还没有运行记录。</td></tr>
       {% endfor %}
     </tbody>
   </table>
