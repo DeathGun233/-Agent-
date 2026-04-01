@@ -5,14 +5,21 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app.auth import ROLE_ADMIN, ROLE_OPERATOR, ROLE_REVIEWER, AuthService, AuthUser
 from app.cache import CacheStore
 from app.config import Settings
 from app.db import Database
-from app.models import BatchExperimentRequest, BulkDeleteRequest, PromptProfileForm, ReviewSubmission, WorkflowRequest, WorkflowRun
+from app.models import (
+    BatchExperimentRequest,
+    BulkDeleteRequest,
+    PromptProfileForm,
+    ReviewSubmission,
+    WorkflowRequest,
+    WorkflowRun,
+)
 from app.repository import WorkflowRepository
 from app.services import BatchExperimentService, CostAnalyticsService, EvaluationService, WorkflowEngine
 
@@ -134,19 +141,9 @@ def _build_llm_summary(run: WorkflowRun) -> dict[str, object]:
 def _build_timeline(run: WorkflowRun) -> list[dict]:
     if not run.logs:
         return []
-    total_seconds = max((run.updated_at - run.created_at).total_seconds(), 1)
     points: list[dict] = []
-    count = len(run.logs)
     for index, log in enumerate(run.logs):
-        offset_seconds = max((log.timestamp - run.created_at).total_seconds(), 0)
-        if count == 1:
-            left = 50.0
-        else:
-            time_left = (offset_seconds / total_seconds) * 100
-            even_left = 6 + (index / max(count - 1, 1)) * 88
-            # Blend uniform spacing with elapsed time so same-second steps do not overlap.
-            left = round(even_left * 0.8 + time_left * 0.2, 2)
-        next_timestamp = run.logs[index + 1].timestamp if index + 1 < count else run.updated_at
+        next_timestamp = run.logs[index + 1].timestamp if index + 1 < len(run.logs) else run.updated_at
         duration_seconds = max((next_timestamp - log.timestamp).total_seconds(), 0)
         points.append(
             {
@@ -154,10 +151,8 @@ def _build_timeline(run: WorkflowRun) -> list[dict]:
                 "agent": log.agent,
                 "message": log.message,
                 "timestamp": log.timestamp.astimezone().strftime("%H:%M:%S"),
-                "left": min(max(left, 2), 98),
                 "duration": f"{duration_seconds:.2f}s",
                 "tool_name": log.tool_call.name if log.tool_call else "",
-                "lane": "top" if index % 2 == 0 else "bottom",
             }
         )
     return points
@@ -173,6 +168,7 @@ def _build_run_rows(runs: list[WorkflowRun]) -> list[dict]:
         rows.append(
             {
                 "id": run.id,
+                "workflow_type": run.workflow_type.value,
                 "title": titles.get(run.workflow_type.value, workflow_label(run.workflow_type.value)),
                 "status": run.status.value,
                 "current_step": run.current_step,
@@ -220,6 +216,119 @@ def _compare_summary() -> dict[str, object]:
         )
     rows.sort(key=lambda item: (-item["run_count"], item["workflow_type"], item["model_name"]))
     return {"rows": rows, "run_count": sum(row["run_count"] for row in rows)}
+
+
+def _build_evaluation_rows(evaluations: list[object]) -> list[dict[str, object]]:
+    dimension_labels = {
+        "status_match": "状态匹配",
+        "keyword_coverage": "关键词覆盖",
+        "result_completeness": "结果完整度",
+        "review_alignment": "审核一致性",
+    }
+    rows: list[dict[str, object]] = []
+    for item in evaluations:
+        candidate_dimensions = item.summary.get("candidate_dimensions", {})
+        baseline_dimensions = item.summary.get("baseline_dimensions", {})
+        dimension_rows = []
+        for key in dict.fromkeys([*candidate_dimensions.keys(), *baseline_dimensions.keys()]):
+            candidate_score = round(float(candidate_dimensions.get(key, 0.0)) * 100, 1)
+            baseline_score = round(float(baseline_dimensions.get(key, 0.0)) * 100, 1)
+            dimension_rows.append(
+                {
+                    "key": key,
+                    "label": dimension_labels.get(key, key),
+                    "candidate_score": candidate_score,
+                    "baseline_score": baseline_score,
+                    "delta": round(candidate_score - baseline_score, 1),
+                }
+            )
+        rows.append(
+            {
+                "id": item.id,
+                "dataset_name": item.dataset_name,
+                "candidate_label": f"{item.candidate_profile.primary_model_name} / {item.candidate_profile.prompt_profile.name}",
+                "baseline_label": f"{item.baseline_profile.primary_model_name} / {item.baseline_profile.prompt_profile.name}",
+                "candidate_avg_score": round(float(item.summary.get('candidate_avg_score', 0.0)) * 100, 1),
+                "baseline_avg_score": round(float(item.summary.get('baseline_avg_score', 0.0)) * 100, 1),
+                "score_delta": round(float(item.summary.get('score_delta', 0.0)) * 100, 1),
+                "case_count": item.summary.get("case_count", len(item.case_results)),
+                "dimension_rows": dimension_rows,
+                "created_at": item.created_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+    return rows
+
+
+def _workflow_export_markdown(run: WorkflowRun) -> str:
+    llm_summary = _build_llm_summary(run)
+    lines = [
+        f"# {workflow_label(run.workflow_type.value)}",
+        "",
+        "## 基本信息",
+        f"- 运行 ID：{run.id}",
+        f"- 状态：{status_label(run.status.value)}",
+        f"- 当前节点：{run.current_step}",
+        f"- 目标：{run.objective}",
+        f"- 创建时间：{run.created_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- 更新时间：{run.updated_at.astimezone().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "## AI 指标",
+        f"- 模型调用次数：{llm_summary['total_requests']}",
+        f"- 累计 Tokens：{llm_summary['total_tokens']}",
+        f"- 平均耗时：{llm_summary['avg_latency_ms']} 毫秒",
+        f"- 累计成本：${llm_summary['total_cost_usd']}",
+        "",
+        "## 审核与决策",
+    ]
+    if run.review:
+        lines.extend(
+            [
+                f"- 审核状态：{status_label(run.review.status.value)}",
+                f"- 是否需要人工审核：{'是' if run.review.needs_human_review else '否'}",
+                f"- 评分：{run.review.score:.2f}",
+                "- 审核理由：",
+            ]
+        )
+        lines.extend([f"  - {item}" for item in run.review.reasons])
+    else:
+        lines.append("- 暂无审核结果")
+    lines.extend(
+        [
+            "",
+            "## 结果 JSON",
+            "```json",
+            _pretty_json(run.result),
+            "```",
+            "",
+            "## 执行日志",
+        ]
+    )
+    for log in run.logs:
+        lines.append(f"- [{log.timestamp.astimezone().strftime('%H:%M:%S')}] {log.agent}：{log.message}")
+    return "\n".join(lines)
+
+
+def _evaluation_export_markdown(item: dict[str, object]) -> str:
+    lines = [
+        f"# {item['dataset_name']} 评测报告",
+        "",
+        "## 方案信息",
+        f"- 候选方案：{item['candidate_label']}",
+        f"- 基线方案：{item['baseline_label']}",
+        f"- 样本数：{item['case_count']}",
+        "",
+        "## 总体得分",
+        f"- 候选平均分：{item['candidate_avg_score']}",
+        f"- 基线平均分：{item['baseline_avg_score']}",
+        f"- 分数差值：{item['score_delta']}",
+        "",
+        "## 多维评分",
+    ]
+    for row in item["dimension_rows"]:
+        lines.append(
+            f"- {row['label']}：候选 {row['candidate_score']} / 基线 {row['baseline_score']} / 差值 {row['delta']}"
+        )
+    return "\n".join(lines)
 
 
 def _common_context(request: Request, user: AuthUser, active_page: str, **kwargs: object) -> dict[str, object]:
@@ -320,16 +429,43 @@ def dashboard(request: Request):
             models=engine.list_model_options(),
             prompt_profiles=engine.list_prompt_profiles(),
             routing_policies=engine.list_routing_policies(),
+            external_source_options=[
+                {"provider": "github_issues", "label": "GitHub Issues", "description": "读取公开仓库 Issue 作为真实客服工单"},
+                {"provider": "nyc_311", "label": "NYC 311", "description": "读取纽约 311 公共投诉数据作为真实工单"},
+            ],
         ),
     )
 
 
 @app.get("/runs", response_class=HTMLResponse)
-def runs_page(request: Request):
+def runs_page(request: Request, status_filter: str = "all", workflow_filter: str = "all"):
     user = _page_user(request)
     if user is None:
         return _redirect_to_login(request)
-    return _template_response(request, "runs.html", _common_context(request, user, "runs", runs=_build_run_rows(engine.list_runs())))
+    all_runs = engine.list_runs()
+    runs = all_runs
+    if status_filter in {"waiting_human", "failed"}:
+        runs = [run for run in runs if run.status.value == status_filter]
+    if workflow_filter != "all":
+        runs = [run for run in runs if run.workflow_type.value == workflow_filter]
+    workflow_options = [{"value": "all", "label": "全部工作流"}] + [
+        {"value": item.workflow_type.value, "label": item.title} for item in engine.list_templates()
+    ]
+    return _template_response(
+        request,
+        "runs.html",
+        _common_context(
+            request,
+            user,
+            "runs",
+            runs=_build_run_rows(runs),
+            status_filter=status_filter,
+            workflow_filter=workflow_filter,
+            workflow_options=workflow_options,
+            filtered_count=len(runs),
+            total_count=len(all_runs),
+        ),
+    )
 
 
 @app.get("/runs/{run_id}", response_class=HTMLResponse)
@@ -356,6 +492,21 @@ def run_detail_page(run_id: str, request: Request):
     )
 
 
+@app.get("/runs/{run_id}/export")
+def export_run_report(run_id: str, request: Request):
+    user = _page_user(request)
+    if user is None:
+        return _redirect_to_login(request)
+    run = engine.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="workflow run not found")
+    return Response(
+        content=_workflow_export_markdown(run),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="workflow-{run.id}.md"'},
+    )
+
+
 @app.post("/runs/{run_id}/delete")
 def delete_run_form(run_id: str, request: Request):
     user = _page_user(request, {ROLE_OPERATOR, ROLE_REVIEWER, ROLE_ADMIN})
@@ -372,9 +523,7 @@ def bulk_delete_runs_form(request: Request, run_ids: list[str] = Form(default_fa
     user = _page_user(request, {ROLE_OPERATOR, ROLE_REVIEWER, ROLE_ADMIN})
     if user is None:
         return _redirect_to_login(request)
-    deleted_ids = engine.delete_runs(run_ids)
-    if not deleted_ids:
-        return RedirectResponse(url="/runs", status_code=303)
+    engine.delete_runs(run_ids)
     return RedirectResponse(url="/runs", status_code=303)
 
 
@@ -403,6 +552,7 @@ def evaluations_page(request: Request):
     user = _page_user(request)
     if user is None:
         return _redirect_to_login(request)
+    evaluation_rows = _build_evaluation_rows(evaluation_service.list_runs())
     return _template_response(
         request,
         "evaluations.html",
@@ -411,7 +561,8 @@ def evaluations_page(request: Request):
             user,
             "evaluations",
             datasets=evaluation_service.list_datasets(),
-            evaluations=evaluation_service.list_runs(),
+            evaluations=evaluation_rows,
+            latest_evaluation=evaluation_rows[0] if evaluation_rows else None,
             models=engine.list_model_options(),
             prompt_profiles=engine.list_prompt_profiles(),
             routing_policies=engine.list_routing_policies(),
@@ -443,6 +594,22 @@ def evaluation_run_submit(
         baseline_routing_policy_id=baseline_routing_policy_id,
     )
     return RedirectResponse(url="/evaluations", status_code=303)
+
+
+@app.get("/evaluations/{evaluation_id}/export")
+def export_evaluation_report(evaluation_id: str, request: Request):
+    user = _page_user(request)
+    if user is None:
+        return _redirect_to_login(request)
+    evaluation = repository.get_evaluation(evaluation_id)
+    if evaluation is None:
+        raise HTTPException(status_code=404, detail="evaluation not found")
+    row = _build_evaluation_rows([evaluation])[0]
+    return Response(
+        content=_evaluation_export_markdown(row),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="evaluation-{evaluation.id}.md"'},
+    )
 
 
 @app.get("/prompts", response_class=HTMLResponse)

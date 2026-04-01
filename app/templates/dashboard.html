@@ -3,14 +3,14 @@
 <div class="header">
   <div>
     <h1>总览面板</h1>
-    <p>选择工作流、配置模型与 Prompt 方案，快速发起一次完整的多智能体执行。</p>
+    <p>选择工作流、模型与 Prompt 方案，必要时填写真实数据源表单后，直接发起一次完整运行。</p>
   </div>
 </div>
 
 <div class="grid two">
   <section class="card">
     <h2>新建工作流</h2>
-    <div class="subtle">从模板载入 JSON 输入，然后直接通过 API 启动运行。</div>
+    <div class="subtle">当前只有“客服工单智能分流”会展示真实数据源前端配置表单。</div>
     <form id="run-form" class="stack" style="margin-top:16px;">
       <label>工作流模板
         <select id="workflow-type">
@@ -40,6 +40,53 @@
           {% endfor %}
         </select>
       </label>
+
+      <div id="external-source-panel" class="card" style="display:none;">
+        <h3>真实数据源配置</h3>
+        <div class="subtle">提交时会自动写入输入 JSON 的 `data_source` 字段，替换默认 mock 工单。</div>
+        <div class="stack" style="margin-top:12px;">
+          <label>数据源类型
+            <select id="data-source-provider">
+              {% for item in external_source_options %}
+              <option value="{{ item.provider }}">{{ item.label }}</option>
+              {% endfor %}
+            </select>
+          </label>
+
+          <div id="github-source-fields" class="stack">
+            <label>仓库
+              <input id="github-repo" value="fastapi/fastapi" placeholder="例如 fastapi/fastapi">
+            </label>
+            <div class="filter-grid">
+              <label>状态
+                <select id="github-state">
+                  <option value="open">open</option>
+                  <option value="closed">closed</option>
+                  <option value="all">all</option>
+                </select>
+              </label>
+              <label>条数
+                <input id="github-per-page" type="number" min="1" max="20" value="5">
+              </label>
+            </div>
+          </div>
+
+          <div id="nyc-source-fields" class="stack" style="display:none;">
+            <label>投诉类型
+              <input id="nyc-complaint-type" placeholder="例如 Noise - Residential">
+            </label>
+            <div class="filter-grid">
+              <label>区域
+                <input id="nyc-borough" placeholder="例如 MANHATTAN">
+              </label>
+              <label>条数
+                <input id="nyc-limit" type="number" min="1" max="20" value="6">
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <label>输入 JSON
         <textarea id="input-payload"></textarea>
       </label>
@@ -50,7 +97,7 @@
 
   <section class="card">
     <h2>待审核任务</h2>
-    <div class="subtle">这些任务已被系统判定需要人工复核。</div>
+    <div class="subtle">这些任务已被系统判断为需要人工复核。</div>
     <div class="stack" style="margin-top:16px;">
       {% for row in review_queue %}
       <a class="card" href="/runs/{{ row.id }}">
@@ -62,7 +109,7 @@
         </div>
       </a>
       {% else %}
-      <div class="subtle">当前没有待审核任务。</div>
+      <div class="empty-state">当前没有待审核任务。</div>
       {% endfor %}
     </div>
   </section>
@@ -77,7 +124,7 @@
         <th>状态</th>
         <th>模型</th>
         <th>Prompt</th>
-        <th>路由</th>
+        <th>路由策略</th>
         <th>更新时间</th>
       </tr>
     </thead>
@@ -102,24 +149,66 @@
   const workflowSelect = document.getElementById("workflow-type");
   const payloadInput = document.getElementById("input-payload");
   const resultBox = document.getElementById("run-result");
+  const externalSourcePanel = document.getElementById("external-source-panel");
+  const dataSourceProvider = document.getElementById("data-source-provider");
+  const githubSourceFields = document.getElementById("github-source-fields");
+  const nycSourceFields = document.getElementById("nyc-source-fields");
+
   function syncPayload() {
     const option = workflowSelect.options[workflowSelect.selectedIndex];
     const sample = option.dataset.sample ? JSON.parse(option.dataset.sample) : {};
     payloadInput.value = JSON.stringify(sample, null, 2);
+    toggleExternalSourcePanel();
   }
+
+  function toggleExternalSourcePanel() {
+    const isSupportWorkflow = workflowSelect.value === "support_triage";
+    externalSourcePanel.style.display = isSupportWorkflow ? "block" : "none";
+    toggleDataSourceFields();
+  }
+
+  function toggleDataSourceFields() {
+    const provider = dataSourceProvider.value;
+    githubSourceFields.style.display = provider === "github_issues" ? "grid" : "none";
+    nycSourceFields.style.display = provider === "nyc_311" ? "grid" : "none";
+  }
+
+  function buildDataSourceConfig() {
+    const provider = dataSourceProvider.value;
+    if (provider === "github_issues") {
+      return {
+        provider,
+        repo: document.getElementById("github-repo").value.trim(),
+        state: document.getElementById("github-state").value,
+        per_page: Number(document.getElementById("github-per-page").value || 5)
+      };
+    }
+    return {
+      provider,
+      complaint_type: document.getElementById("nyc-complaint-type").value.trim(),
+      borough: document.getElementById("nyc-borough").value.trim(),
+      limit: Number(document.getElementById("nyc-limit").value || 6)
+    };
+  }
+
   workflowSelect.addEventListener("change", syncPayload);
+  dataSourceProvider.addEventListener("change", toggleDataSourceFields);
   syncPayload();
 
   document.getElementById("run-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     resultBox.textContent = "正在启动工作流...";
     try {
+      const inputPayload = JSON.parse(payloadInput.value || "{}");
+      if (workflowSelect.value === "support_triage") {
+        inputPayload.data_source = buildDataSourceConfig();
+      }
       const response = await fetch("/api/workflows/run", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
           workflow_type: workflowSelect.value,
-          input_payload: JSON.parse(payloadInput.value || "{}"),
+          input_payload: inputPayload,
           model_name_override: document.getElementById("model-name").value,
           prompt_profile_id: document.getElementById("prompt-profile-id").value,
           routing_policy_id: document.getElementById("routing-policy-id").value

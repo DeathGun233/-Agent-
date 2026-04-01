@@ -3,19 +3,46 @@
 <div class="header">
   <div>
     <h1>运行历史</h1>
-    <p>查看所有工作流实例，并在误创建时直接删除无效记录。</p>
+    <p>支持只看待审核、只看失败、按工作流类型筛选，也可以批量勾选后一起删除。</p>
   </div>
 </div>
 
+<section class="card" style="margin-bottom:18px;">
+  <form method="get" action="/runs" class="stack">
+    <div class="filter-grid">
+      <label>状态筛选
+        <select name="status_filter">
+          <option value="all" {% if status_filter == "all" %}selected{% endif %}>全部状态</option>
+          <option value="waiting_human" {% if status_filter == "waiting_human" %}selected{% endif %}>只看待审核</option>
+          <option value="failed" {% if status_filter == "failed" %}selected{% endif %}>只看失败</option>
+        </select>
+      </label>
+      <label>工作流筛选
+        <select name="workflow_filter">
+          {% for item in workflow_options %}
+          <option value="{{ item.value }}" {% if workflow_filter == item.value %}selected{% endif %}>{{ item.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div style="display:flex;align-items:end;gap:10px;">
+        <button type="submit">应用筛选</button>
+        <a class="btn ghost" href="/runs">重置</a>
+      </div>
+    </div>
+  </form>
+  <div class="subtle" style="margin-top:12px;">当前显示 {{ filtered_count }} 条，全部记录共 {{ total_count }} 条。</div>
+</section>
+
 <section class="card">
-  {% if capabilities.can_run or capabilities.can_review or capabilities.can_admin %}
+{% if capabilities.can_run or capabilities.can_review or capabilities.can_admin %}
   <form method="post" action="/runs/bulk-delete" id="bulk-delete-form" onsubmit="return confirmBulkDelete();" style="margin-bottom:16px;">
-    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+    <div class="toolbar">
       <button type="button" class="ghost" onclick="toggleAllRuns(true)">全选</button>
       <button type="button" class="ghost" onclick="toggleAllRuns(false)">取消全选</button>
       <button type="submit" class="secondary" id="bulk-delete-button" disabled>删除已选记录</button>
       <span class="subtle" id="selected-run-count">当前未选中记录</span>
     </div>
+  </form>
   {% endif %}
   <table>
     <thead>
@@ -47,17 +74,20 @@
           >
         </td>
         {% endif %}
-        <td><a href="/runs/{{ row.id }}"><strong>{{ row.title }}</strong></a><div class="subtle">{{ row.objective }}</div></td>
+        <td>
+          <a href="/runs/{{ row.id }}"><strong>{{ row.title }}</strong></a>
+          <div class="subtle">{{ row.objective }}</div>
+        </td>
         <td><span class="badge status-{{ row.status }}">{{ status_label(row.status) }}</span></td>
         <td>{{ row.model_name }}</td>
         <td>{{ row.prompt_profile_label }}</td>
         <td>{{ row.routing_policy_name }}</td>
         <td>{{ row.updated_at }}</td>
         <td>
-          <div style="display:flex;gap:8px;align-items:center;">
+          <div class="toolbar">
             <a class="badge" href="/runs/{{ row.id }}">查看</a>
             {% if capabilities.can_run or capabilities.can_review or capabilities.can_admin %}
-            <form method="post" action="/runs/{{ row.id }}/delete" onsubmit="return confirm('确认删除这条工作流记录吗？');" style="margin:0;">
+            <form method="post" action="/runs/{{ row.id }}/delete" onsubmit="return confirm('确认删除这条工作流记录吗？');">
               <button type="submit" class="secondary">删除</button>
             </form>
             {% endif %}
@@ -65,13 +95,10 @@
         </td>
       </tr>
       {% else %}
-      <tr><td colspan="{% if capabilities.can_run or capabilities.can_review or capabilities.can_admin %}8{% else %}7{% endif %}" class="subtle">还没有运行记录。</td></tr>
+      <tr><td colspan="{% if capabilities.can_run or capabilities.can_review or capabilities.can_admin %}8{% else %}7{% endif %}" class="subtle">当前筛选条件下暂无记录。</td></tr>
       {% endfor %}
     </tbody>
   </table>
-  {% if capabilities.can_run or capabilities.can_review or capabilities.can_admin %}
-  </form>
-  {% endif %}
 </section>
 
 {% if capabilities.can_run or capabilities.can_review or capabilities.can_admin %}

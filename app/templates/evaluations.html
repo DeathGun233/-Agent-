@@ -3,7 +3,7 @@
 <div class="header">
   <div>
     <h1>自动评测</h1>
-    <p>运行候选方案与基线方案对比，并把人工反馈样本纳入回归验证。</p>
+    <p>发起候选方案与基线方案的对比评测，并用图表展示多维评分，不再只看文本分数。</p>
   </div>
 </div>
 
@@ -14,7 +14,7 @@
       <label>评测集
         <select name="dataset_id">
           {% for item in datasets %}
-          <option value="{{ item.dataset_id }}">{{ item.name }} · {{ item.case_count }} 条样本</option>
+          <option value="{{ item.dataset_id }}">{{ item.name }} / {{ item.case_count }} 条样本</option>
           {% endfor %}
         </select>
       </label>
@@ -36,7 +36,7 @@
                 {% endfor %}
               </select>
             </label>
-            <label>路由
+            <label>路由策略
               <select name="candidate_routing_policy_id">
                 {% for item in routing_policies %}
                 <option value="{{ item.policy_id }}">{{ item.name }}</option>
@@ -62,7 +62,7 @@
                 {% endfor %}
               </select>
             </label>
-            <label>路由
+            <label>路由策略
               <select name="baseline_routing_policy_id">
                 {% for item in routing_policies %}
                 <option value="{{ item.policy_id }}">{{ item.name }}</option>
@@ -90,49 +90,100 @@
   </section>
 </div>
 
+{% if latest_evaluation %}
+<section class="card" style="margin-top:18px;">
+  <div class="toolbar" style="justify-content:space-between;">
+    <div>
+      <h2 style="margin-bottom:6px;">最新评测图表</h2>
+      <div class="subtle">{{ latest_evaluation.dataset_name }} / {{ latest_evaluation.created_at }}</div>
+    </div>
+    <a class="btn ghost" href="/evaluations/{{ latest_evaluation.id }}/export">导出报告</a>
+  </div>
+  <div class="grid three" style="margin-top:16px;">
+    <div class="card">
+      <div class="subtle">候选平均分</div>
+      <div class="metric">{{ latest_evaluation.candidate_avg_score }}</div>
+    </div>
+    <div class="card">
+      <div class="subtle">基线平均分</div>
+      <div class="metric">{{ latest_evaluation.baseline_avg_score }}</div>
+    </div>
+    <div class="card">
+      <div class="subtle">分数差值</div>
+      <div class="metric">{{ latest_evaluation.score_delta }}</div>
+    </div>
+  </div>
+  <div class="grid two" style="margin-top:18px;">
+    {% for row in latest_evaluation.dimension_rows %}
+    <div class="card">
+      <strong>{{ row.label }}</strong>
+      <div class="bar-group" style="margin-top:12px;">
+        <div class="bar-row">
+          <div class="bar-label"><span>候选方案</span><span>{{ row.candidate_score }}</span></div>
+          <div class="bar-track"><div class="bar-fill-candidate" style="width: {{ row.candidate_score }}%;"></div></div>
+        </div>
+        <div class="bar-row">
+          <div class="bar-label"><span>基线方案</span><span>{{ row.baseline_score }}</span></div>
+          <div class="bar-track"><div class="bar-fill-baseline" style="width: {{ row.baseline_score }}%;"></div></div>
+        </div>
+        <div class="subtle">差值 {{ row.delta }}</div>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
 <section class="card" style="margin-top:18px;">
   <h2>评测历史</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>评测集</th>
-        <th>候选方案</th>
-        <th>基线方案</th>
-        <th>结果摘要</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for item in evaluations %}
-      <tr>
-        <td>{{ item.dataset_name }}</td>
-        <td>{{ item.candidate_profile.primary_model_name }} · {{ item.candidate_profile.prompt_profile.name }}</td>
-        <td>{{ item.baseline_profile.primary_model_name }} · {{ item.baseline_profile.prompt_profile.name }}</td>
-        <td>
-          <div>候选平均分：{{ item.summary.candidate_avg_score }}</div>
-          <div>基线平均分：{{ item.summary.baseline_avg_score }}</div>
-          <div>分数差值：{{ item.summary.score_delta }}</div>
-          {% if item.summary.candidate_dimensions %}
-          <div class="subtle" style="margin-top:8px;">
-            候选维度：
-            {% for key, value in item.summary.candidate_dimensions.items() %}
-            {{ key }}={{ value }}{% if not loop.last %}，{% endif %}
-            {% endfor %}
+  <div class="stack">
+    {% for item in evaluations %}
+    <div class="card">
+      <div class="toolbar" style="justify-content:space-between;">
+        <div>
+          <strong>{{ item.dataset_name }}</strong>
+          <div class="subtle">{{ item.created_at }}</div>
+        </div>
+        <a class="btn ghost" href="/evaluations/{{ item.id }}/export">导出报告</a>
+      </div>
+      <div class="subtle" style="margin-top:8px;">候选方案：{{ item.candidate_label }}</div>
+      <div class="subtle">基线方案：{{ item.baseline_label }}</div>
+      <div class="grid three" style="margin-top:12px;">
+        <div class="card">
+          <div class="subtle">候选平均分</div>
+          <div class="metric">{{ item.candidate_avg_score }}</div>
+        </div>
+        <div class="card">
+          <div class="subtle">基线平均分</div>
+          <div class="metric">{{ item.baseline_avg_score }}</div>
+        </div>
+        <div class="card">
+          <div class="subtle">分数差值</div>
+          <div class="metric">{{ item.score_delta }}</div>
+        </div>
+      </div>
+      <div class="grid two" style="margin-top:12px;">
+        {% for row in item.dimension_rows %}
+        <div class="card">
+          <strong>{{ row.label }}</strong>
+          <div class="bar-group" style="margin-top:12px;">
+            <div class="bar-row">
+              <div class="bar-label"><span>候选方案</span><span>{{ row.candidate_score }}</span></div>
+              <div class="bar-track"><div class="bar-fill-candidate" style="width: {{ row.candidate_score }}%;"></div></div>
+            </div>
+            <div class="bar-row">
+              <div class="bar-label"><span>基线方案</span><span>{{ row.baseline_score }}</span></div>
+              <div class="bar-track"><div class="bar-fill-baseline" style="width: {{ row.baseline_score }}%;"></div></div>
+            </div>
+            <div class="subtle">差值 {{ row.delta }}</div>
           </div>
-          {% endif %}
-          {% if item.summary.baseline_dimensions %}
-          <div class="subtle">
-            基线维度：
-            {% for key, value in item.summary.baseline_dimensions.items() %}
-            {{ key }}={{ value }}{% if not loop.last %}，{% endif %}
-            {% endfor %}
-          </div>
-          {% endif %}
-        </td>
-      </tr>
-      {% else %}
-      <tr><td colspan="4" class="subtle">当前还没有评测记录。</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% else %}
+    <div class="empty-state">当前还没有评测记录。</div>
+    {% endfor %}
+  </div>
 </section>
 {% endblock %}

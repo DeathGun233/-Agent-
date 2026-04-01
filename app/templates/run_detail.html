@@ -5,9 +5,10 @@
     <h1>{{ workflow_label(run.workflow_type.value) }}</h1>
     <p>{{ run.objective }}</p>
   </div>
-  <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+  <div class="toolbar">
     <span class="badge status-{{ run.status.value }}">{{ status_label(run.status.value) }}</span>
-    {% if run.review %}<span class="badge">评分={{ "%.2f"|format(run.review.score) }}</span>{% endif %}
+    {% if run.review %}<span class="badge">评分 {{ "%.2f"|format(run.review.score) }}</span>{% endif %}
+    <a class="btn ghost" href="/runs/{{ run.id }}/export">导出报告</a>
     {% if capabilities.can_run or capabilities.can_review or capabilities.can_admin %}
     <form method="post" action="/runs/{{ run.id }}/delete" onsubmit="return confirm('确认删除这条工作流及其反馈样本吗？');" style="margin:0;">
       <button type="submit" class="secondary">删除该工作流</button>
@@ -30,7 +31,7 @@
   <div class="card">
     <div class="subtle">累计成本</div>
     <div class="metric">${{ llm_summary.total_cost_usd }}</div>
-    <div class="subtle">平均时延：{{ llm_summary.avg_latency_ms }} 毫秒</div>
+    <div class="subtle">平均耗时：{{ llm_summary.avg_latency_ms }} 毫秒</div>
   </div>
 </div>
 
@@ -45,7 +46,7 @@
       <div class="timeline-card">
         <div class="timeline-head">
           <div class="timeline-agent">{{ point.index }}. {{ point.agent }}</div>
-          <div class="timeline-meta">{{ point.timestamp }} · 耗时 {{ point.duration }}</div>
+          <div class="timeline-meta">{{ point.timestamp }} / 耗时 {{ point.duration }}</div>
         </div>
         <div class="timeline-message">{{ point.message }}</div>
         {% if point.tool_name %}
@@ -70,11 +71,11 @@
         {% if log.llm_call %}
         <div class="subtle">
           模型={{ log.llm_call.model_name }}
-          · 路由={{ log.llm_call.route_target }}
-          · 时延={{ log.llm_call.latency_ms }} 毫秒
-          · 成本=${{ log.llm_call.estimated_cost_usd }}
-          · 重试={{ log.llm_call.retry_count }}
-          {% if log.llm_call.validation_error %}· 校验={{ log.llm_call.validation_error }}{% endif %}
+          / 路由={{ log.llm_call.route_target }}
+          / 耗时={{ log.llm_call.latency_ms }} 毫秒
+          / 成本=${{ log.llm_call.estimated_cost_usd }}
+          / 重试={{ log.llm_call.retry_count }}
+          {% if log.llm_call.validation_error %}/ 校验={{ log.llm_call.validation_error }}{% endif %}
         </div>
         {% endif %}
       </div>
@@ -85,9 +86,11 @@
   <section class="card">
     <h2>审核与决策</h2>
     {% if run.review %}
-      <div class="badge">{{ status_label(run.review.status.value) }}</div>
-      <div class="badge">需要人工审核={{ run.review.needs_human_review }}</div>
-      <div class="badge">评分={{ "%.2f"|format(run.review.score) }}</div>
+      <div class="toolbar">
+        <span class="badge">{{ status_label(run.review.status.value) }}</span>
+        <span class="badge">需要人工审核：{{ "是" if run.review.needs_human_review else "否" }}</span>
+        <span class="badge">评分 {{ "%.2f"|format(run.review.score) }}</span>
+      </div>
       <div class="stack" style="margin-top:12px;">
         {% for reason in run.review.reasons %}
         <div class="card">{{ reason }}</div>
@@ -101,7 +104,7 @@
       <label>人工审核备注
         <textarea id="review-comment" placeholder="请输入人工判断和处理说明"></textarea>
       </label>
-      <div style="display:flex;gap:12px;">
+      <div class="toolbar">
         <button type="button" onclick="submitReview(true)">审核通过</button>
         <button type="button" class="secondary" onclick="submitReview(false)">驳回任务</button>
       </div>
