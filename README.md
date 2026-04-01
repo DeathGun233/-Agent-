@@ -1,13 +1,16 @@
 # FlowPilot
 
-FlowPilot 是一个面向企业场景的多 Agent AI 工作流实验平台，核心目标不是“检索信息”，而是“把任务执行完”。  
-它适合和你已有的企业级 RAG 知识库项目形成互补：前者解决“找信息”，这个项目解决“做任务、跑流程、做评测、看成本、做优化”。
+FlowPilot 是一个面向企业场景的多 Agent AI 工作流实验平台，核心目标不是“检索信息”，而是“把任务执行完”。
+
+它适合和已有的企业级 RAG 知识库项目形成互补：
+- RAG 项目解决“找信息”
+- 这个项目解决“做任务、跑流程、做评测、看成本、做优化”
 
 最后更新：`2026-04-01`
 
 ## 项目定位
 
-项目聚焦以下 AI 应用开发能力：
+项目重点覆盖这些 AI 应用开发能力：
 
 - 多 Agent 协作执行
 - LangGraph 状态流编排
@@ -37,7 +40,28 @@ FlowPilot 是一个面向企业场景的多 Agent AI 工作流实验平台，核
 - `support_triage`：客服工单分流
 - `meeting_minutes`：会议纪要转执行项
 
-### 2. AI 应用实验能力
+### 2. 真实数据源接入
+
+项目已接入 2 个可直接演示的真实公共数据源，用于替换部分 mock 工具：
+
+- `GitHub Issues`：从公开仓库实时拉取 issue，映射为客服/工单类任务
+- `NYC 311`：从纽约市 311 公共服务请求数据中拉取真实工单样本
+
+支持在 `support_triage` 的 `input_payload.data_source` 中切换数据源。
+
+### 3. Agent 结构化输出能力
+
+- `AnalystAgent / ContentAgent / ReviewerAgent` 均加入 schema 校验
+- 大模型输出不符合结构时会自动重试
+- 每次调用都会记录：
+  - `模型`
+  - `Prompt`
+  - `Tokens`
+  - `耗时`
+  - `重试次数`
+  - `校验错误`
+
+### 4. AI 实验与评测能力
 
 - Prompt 历史版本新增与编辑
 - Prompt 方案切换与对比
@@ -45,17 +69,21 @@ FlowPilot 是一个面向企业场景的多 Agent AI 工作流实验平台，核
 - Prompt / 模型批量 A/B 实验
 - 自动评测集运行与基线对比
 - 人工审核反馈自动回流成评测样本
+- 多维评测体系：
+  - `status_match`
+  - `keyword_coverage`
+  - `result_completeness`
+  - `review_alignment`
 
-### 3. AI 可观测性与成本管理
+### 5. AI 可观测性与成本管理
 
-- 记录每次 LLM 调用的 `模型 / Prompt / Tokens / 耗时 / 回退情况`
 - 汇总工作流级 AI 调用指标
 - 成本统计与预算看板
 - 预算阈值提醒
 - 成本趋势展示
 - 批量实验结果排序与冠军方案标记
 
-### 4. 企业工作台能力
+### 6. 企业工作台能力
 
 - 运行历史页
 - 人工审核页
@@ -93,8 +121,6 @@ FlowPilot 是一个面向企业场景的多 Agent AI 工作流实验平台，核
 
 - `https://dashscope.aliyuncs.com/compatible-mode/v1`
 
-支持通过环境变量切换模型和端点。
-
 ## 环境变量
 
 常用环境变量如下：
@@ -104,14 +130,20 @@ FlowPilot 是一个面向企业场景的多 Agent AI 工作流实验平台，核
 - `OPEN_AI_KEY`
 - `MODEL_NAME`
 - `MODEL_BASE_URL`
+- `GITHUB_TOKEN`
 - `DATABASE_URL`
 - `REDIS_URL`
+- `FLOWPILOT_DISABLE_LLM`
+- `FLOWPILOT_HTTP_TIMEOUT_SECONDS`
+- `FLOWPILOT_MONTHLY_BUDGET_USD`
 - `FLOWPILOT_SECRET_KEY`
 - `FLOWPILOT_SESSION_COOKIE`
 - `FLOWPILOT_USERS_JSON`
-- `FLOWPILOT_MONTHLY_BUDGET_USD`
 
-如果你已经配置了 `OPEN_AI_KEY` 或 `DASHSCOPE_API_KEY`，项目可直接调用模型。
+说明：
+
+- 如果你已经配置了 `OPEN_AI_KEY` 或 `DASHSCOPE_API_KEY`，项目可直接调用模型
+- `GITHUB_TOKEN` 不是必须，但配置后访问 GitHub Issues 更稳定
 
 ## 本地启动
 
@@ -151,6 +183,8 @@ REDIS_URL=redis://127.0.0.1:6379/0
 python -m pytest -q
 ```
 
+当前测试状态：`23 passed`
+
 ## 主要页面
 
 - `/dashboard`：总览面板
@@ -183,6 +217,34 @@ python -m pytest -q
 - `POST /api/prompts`
 - `PUT /api/prompts/{id}`
 
+## 真实数据源怎么用
+
+在 `support_triage` 的输入 JSON 里，可以直接加：
+
+```json
+{
+  "data_source": {
+    "provider": "github_issues",
+    "repo": "fastapi/fastapi",
+    "state": "open",
+    "per_page": 5
+  }
+}
+```
+
+或者：
+
+```json
+{
+  "data_source": {
+    "provider": "nyc_311",
+    "complaint_type": "Noise - Residential",
+    "borough": "BROOKLYN",
+    "limit": 5
+  }
+}
+```
+
 ## 使用建议
 
 如果你是第一次体验，建议按下面顺序看：
@@ -193,15 +255,6 @@ python -m pytest -q
 4. 进入详情页查看执行轨迹、AI 调用指标和结果 JSON
 5. 如果任务进入人工接管，到 `/reviews` 处理审核
 6. 到 `/compare`、`/evaluations`、`/costs`、`/batches` 查看实验、评测与成本表现
-
-## 适合简历/面试怎么讲
-
-这个项目最适合强调的方向是：
-
-- 我不只做 RAG，也做 Agent 执行与工作流编排
-- 我能把 Prompt、模型、Tokens、耗时、成本做成可观测指标
-- 我支持 Prompt 管理、多模型路由、自动评测、人工反馈闭环
-- 我能把 AI 应用做成企业工作台，而不是单一聊天 Demo
 
 ## 文档索引
 
@@ -215,3 +268,4 @@ python -m pytest -q
 - [第7步-Prompt版本管理与对比页](./docs/第7步-Prompt版本管理与对比页.md)
 - [第8步-Prompt路由与自动评测升级](./docs/第8步-Prompt路由与自动评测升级.md)
 - [第9步-成本看板批量实验与反馈闭环](./docs/第9步-成本看板批量实验与反馈闭环.md)
+- [第10步-真实数据源与结构化评测升级](./docs/第10步-真实数据源与结构化评测升级.md)

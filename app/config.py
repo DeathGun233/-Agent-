@@ -14,8 +14,10 @@ class Settings:
     model_name: str = "qwen3-max"
     model_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     api_key: str | None = None
+    github_token: str | None = None
     disable_llm: bool = False
     monthly_budget_usd: float = 25.0
+    http_timeout_seconds: float = 12.0
     secret_key: str = "flowpilot-demo-secret"
     session_cookie_name: str = "flowpilot_session"
     users_json: str | None = None
@@ -38,8 +40,10 @@ class Settings:
             model_name=os.getenv("MODEL_NAME", "qwen3-max"),
             model_base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
             api_key=api_key,
+            github_token=os.getenv("GITHUB_TOKEN"),
             disable_llm=disable_llm,
             monthly_budget_usd=float(os.getenv("FLOWPILOT_MONTHLY_BUDGET_USD", "25")),
+            http_timeout_seconds=float(os.getenv("FLOWPILOT_HTTP_TIMEOUT_SECONDS", "12")),
             secret_key=os.getenv("FLOWPILOT_SECRET_KEY", "flowpilot-demo-secret"),
             session_cookie_name=os.getenv("FLOWPILOT_SESSION_COOKIE", "flowpilot_session"),
             users_json=os.getenv("FLOWPILOT_USERS_JSON"),

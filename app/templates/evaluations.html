@@ -111,6 +111,22 @@
           <div>候选平均分：{{ item.summary.candidate_avg_score }}</div>
           <div>基线平均分：{{ item.summary.baseline_avg_score }}</div>
           <div>分数差值：{{ item.summary.score_delta }}</div>
+          {% if item.summary.candidate_dimensions %}
+          <div class="subtle" style="margin-top:8px;">
+            候选维度：
+            {% for key, value in item.summary.candidate_dimensions.items() %}
+            {{ key }}={{ value }}{% if not loop.last %}，{% endif %}
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if item.summary.baseline_dimensions %}
+          <div class="subtle">
+            基线维度：
+            {% for key, value in item.summary.baseline_dimensions.items() %}
+            {{ key }}={{ value }}{% if not loop.last %}，{% endif %}
+            {% endfor %}
+          </div>
+          {% endif %}
         </td>
       </tr>
       {% else %}

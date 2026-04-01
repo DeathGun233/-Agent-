@@ -11,16 +11,20 @@ from langgraph.graph import END, START, StateGraph
 
 from app.config import Settings
 from app.data import RISK_CUSTOMERS, SALES_DATA, WORKFLOW_TEMPLATES
+from app.external_data import ExternalDataError, ExternalDataService
 from app.llm import LLMService
 from app.models import (
+    AnalystOutput,
     BatchExperimentRequest,
     BatchExperimentRun,
+    ContentOutput,
     EvaluationRun,
     ExecutionProfile,
     FeedbackSample,
     PromptProfile,
     PromptProfileForm,
     ReviewDecision,
+    ReviewOutput,
     ReviewSubmission,
     RunStatus,
     ToolCall,
@@ -194,6 +198,9 @@ class PlannerAgent:
 
 
 class ToolCenter:
+    def __init__(self, external_data: ExternalDataService) -> None:
+        self.external_data = external_data
+
     def run(self, workflow_type: WorkflowType, payload: dict[str, Any]) -> tuple[dict[str, Any], ToolCall]:
         if workflow_type == WorkflowType.SALES_FOLLOWUP:
             result = self._sales_analytics(payload)
@@ -202,8 +209,8 @@ class ToolCenter:
             result = self._marketing_brief(payload)
             return result, ToolCall(name="marketing_brief_tool", input=payload, output=result)
         if workflow_type == WorkflowType.SUPPORT_TRIAGE:
-            result = self._support_triage(payload)
-            return result, ToolCall(name="support_triage_tool", input=payload, output=result)
+            result, tool_name = self._support_triage(payload)
+            return result, ToolCall(name=tool_name, input=payload, output=result)
         result = self._meeting_extract(payload)
         return result, ToolCall(name="meeting_minutes_tool", input=payload, output=result)
 
@@ -250,37 +257,56 @@ class ToolCenter:
             "channel_notes": {channel: f"为 {channel} 准备一个主卖点和一个行动号召" for channel in channels},
         }
 
-    @staticmethod
-    def _support_triage(payload: dict[str, Any]) -> dict[str, Any]:
+    def _support_triage(self, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
         tickets = payload.get("tickets", [])
+        data_source = payload.get("data_source")
+        tool_name = "support_triage_tool"
+        source_summary: dict[str, Any] = {}
+        if isinstance(data_source, dict) and data_source.get("provider"):
+            try:
+                batch = self.external_data.load_support_tickets(data_source)
+                tickets = batch.records
+                tool_name = f"{batch.provider}_tool"
+                source_summary = {"provider": batch.provider, **batch.summary}
+            except ExternalDataError as exc:
+                source_summary = {
+                    "provider": str(data_source.get("provider", "")),
+                    "error": str(exc),
+                    "fallback_to_sample": True,
+                }
         enriched = []
         for index, ticket in enumerate(tickets, start=1):
-            message = str(ticket.get("message", "")).lower()
-            severity = "中"
-            category = "普通咨询"
-            if any(keyword in message for keyword in ["error", "outage", "release", "production", "blocked", "报错", "故障", "上线", "生产", "恢复"]):
-                severity = "高"
-                category = "故障事件"
-            elif any(keyword in message for keyword in ["refund", "complaint", "angry", "投诉", "退款"]):
-                severity = "高"
-                category = "投诉问题"
-            elif any(keyword in message for keyword in ["invoice", "contract", "billing", "开票", "合同", "账单"]):
-                severity = "低"
-                category = "账单合同"
+            message = f"{ticket.get('message', '')} {ticket.get('body', '')}".lower()
+            severity = "medium"
+            category = "general_inquiry"
+            if any(keyword in message for keyword in ["error", "outage", "release", "production", "blocked", "\u62a5\u9519", "\u6545\u969c", "\u4e0a\u7ebf", "\u751f\u4ea7", "\u6062\u590d"]):
+                severity = "high"
+                category = "incident"
+            elif any(keyword in message for keyword in ["refund", "complaint", "angry", "\u6295\u8bc9", "\u9000\u6b3e"]):
+                severity = "high"
+                category = "complaint"
+            elif any(keyword in message for keyword in ["invoice", "contract", "billing", "\u5f00\u7968", "\u5408\u540c", "\u8d26\u5355"]):
+                severity = "low"
+                category = "billing"
             enriched.append(
                 {
-                    "ticket_id": f"T-{index:03d}",
+                    "ticket_id": str(ticket.get("source_id") or f"T-{index:03d}"),
                     "customer": ticket.get("customer", f"客户{index}"),
                     "category": category,
                     "priority": severity,
                     "message": ticket.get("message", ""),
+                    "body": ticket.get("body", ""),
+                    "source_id": ticket.get("source_id", ""),
+                    "source_url": ticket.get("source_url", ""),
                 }
             )
-        return {
+        result = {
             "tickets": enriched,
-            "high_priority_count": sum(1 for item in enriched if item["priority"] == "高"),
-            "requires_incident_handoff": any(item["category"] == "故障事件" for item in enriched),
+            "high_priority_count": sum(1 for item in enriched if item["priority"] == "high"),
+            "requires_incident_handoff": any(item["category"] == "incident" for item in enriched),
+            "data_source_summary": source_summary,
         }
+        return result, tool_name
 
     @staticmethod
     def _meeting_extract(payload: dict[str, Any]) -> dict[str, Any]:
@@ -332,6 +358,7 @@ class AnalystAgent:
             user_prompt=user_prompt,
             fallback=fallback,
             execution_profile=execution_profile,
+            response_model=AnalystOutput,
         )
         payload = response.payload
         payload.setdefault("summary", fallback["summary"])
@@ -422,6 +449,7 @@ class ContentAgent:
             user_prompt=user_prompt,
             fallback=fallback,
             execution_profile=execution_profile,
+            response_model=ContentOutput,
         )
         payload = response.payload
         payload.setdefault("deliverables", fallback["deliverables"])
@@ -507,6 +535,7 @@ class ReviewerAgent:
             user_prompt=user_prompt,
             fallback=fallback,
             execution_profile=execution_profile,
+            response_model=ReviewOutput,
         )
         merged = self._merge_review(fallback, response.payload)
         return merged, response.call
@@ -677,7 +706,8 @@ class WorkflowEngine:
         self.repository = repository
         self.settings = settings
         self.prompt_profiles = PromptProfileService(repository)
-        self.tool_center = ToolCenter()
+        self.external_data = ExternalDataService(settings)
+        self.tool_center = ToolCenter(self.external_data)
         self.llm_service = LLMService(settings)
         self.planner_agent = PlannerAgent()
         self.analyst_agent = AnalystAgent(self.llm_service)
@@ -960,6 +990,8 @@ class EvaluationService:
         case_results = []
         candidate_scores: list[float] = []
         baseline_scores: list[float] = []
+        candidate_dimension_rollups: dict[str, list[float]] = {}
+        baseline_dimension_rollups: dict[str, list[float]] = {}
         for case in dataset.cases:
             candidate_run = self.engine.run_workflow(
                 WorkflowRequest(
@@ -981,10 +1013,16 @@ class EvaluationService:
                 ),
                 persist=False,
             )
-            candidate_score = self._score_run(candidate_run, case)
-            baseline_score = self._score_run(baseline_run, case)
+            candidate_dimensions = self._score_dimensions(candidate_run, case)
+            baseline_dimensions = self._score_dimensions(baseline_run, case)
+            candidate_score = round(mean(candidate_dimensions.values()), 3)
+            baseline_score = round(mean(baseline_dimensions.values()), 3)
             candidate_scores.append(candidate_score)
             baseline_scores.append(baseline_score)
+            for key, value in candidate_dimensions.items():
+                candidate_dimension_rollups.setdefault(key, []).append(value)
+            for key, value in baseline_dimensions.items():
+                baseline_dimension_rollups.setdefault(key, []).append(value)
             case_results.append(
                 {
                     "case_id": case.case_id,
@@ -993,6 +1031,8 @@ class EvaluationService:
                     "baseline_status": baseline_run.status.value,
                     "candidate_score": candidate_score,
                     "baseline_score": baseline_score,
+                    "candidate_dimensions": candidate_dimensions,
+                    "baseline_dimensions": baseline_dimensions,
                     "candidate_metrics": summarize_run_metrics(candidate_run),
                     "baseline_metrics": summarize_run_metrics(baseline_run),
                 }
@@ -1007,6 +1047,12 @@ class EvaluationService:
                 "candidate_avg_score": round(mean(candidate_scores), 3) if candidate_scores else 0.0,
                 "baseline_avg_score": round(mean(baseline_scores), 3) if baseline_scores else 0.0,
                 "score_delta": round((mean(candidate_scores) - mean(baseline_scores)), 3) if candidate_scores else 0.0,
+                "candidate_dimensions": {
+                    key: round(mean(values), 3) for key, values in candidate_dimension_rollups.items()
+                },
+                "baseline_dimensions": {
+                    key: round(mean(values), 3) for key, values in baseline_dimension_rollups.items()
+                },
             },
             case_results=case_results,
         )
@@ -1044,7 +1090,7 @@ class EvaluationService:
         )
 
     @staticmethod
-    def _score_run(run: WorkflowRun, case: EvaluationCaseDefinition) -> float:
+    def _score_dimensions(run: WorkflowRun, case: EvaluationCaseDefinition) -> dict[str, float]:
         status_score = 1.0 if run.status.value == case.expected_status else 0.0
         text = json.dumps(run.result, ensure_ascii=False).lower()
         if not case.expected_keywords:
@@ -1052,7 +1098,19 @@ class EvaluationService:
         else:
             hits = sum(1 for keyword in case.expected_keywords if keyword.lower() in text)
             keyword_score = hits / len(case.expected_keywords)
-        return round(status_score * 0.5 + keyword_score * 0.5, 3)
+        result = run.result if isinstance(run.result, dict) else {}
+        completeness_score = 1.0 if all(key in result for key in ["raw_result", "analysis", "deliverables", "review"]) else 0.0
+        review = run.review
+        if review is None:
+            review_alignment = 0.0
+        else:
+            review_alignment = 1.0 if review.needs_human_review == (run.status == RunStatus.WAITING_HUMAN) else 0.5
+        return {
+            "status_match": round(status_score, 3),
+            "keyword_coverage": round(keyword_score, 3),
+            "result_completeness": round(completeness_score, 3),
+            "review_alignment": round(review_alignment, 3),
+        }
 
 
 class BatchExperimentService:

@@ -1,10 +1,18 @@
+import json
+from types import SimpleNamespace
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from app.config import Settings
 from app.db import UserAccountRecord
+from app.external_data import ExternalDataService, ExternalTicketBatch
 from app.main import app, database
-from app.services import ReviewerAgent
+from app.models import ReviewDecision, RunStatus, WorkflowRun, WorkflowType
+from app.prompt_catalog import BUILTIN_PROMPT_PROFILES, EvaluationCaseDefinition, resolve_execution_profile
+from app.services import EvaluationService, ReviewerAgent, ToolCenter
+from app.llm import LLMService
+from app.models import AnalystOutput
 
 
 client = TestClient(app)
@@ -272,6 +280,7 @@ def test_evaluation_run_and_listing_work() -> None:
     assert len(evaluations) >= 1
     assert evaluations[0]["dataset_id"] in {"ops-regression-v1", "feedback-loop-v1"}
     assert "candidate_avg_score" in evaluations[0]["summary"]
+    assert "candidate_dimensions" in evaluations[0]["summary"]
 
 
 def test_cost_summary_page_and_api_work() -> None:
@@ -401,3 +410,119 @@ def test_run_can_be_deleted_and_related_feedback_samples_are_removed() -> None:
     assert all(item["id"] != created["id"] for item in workflows)
     feedback_samples_after = client.get("/api/feedback-samples").json()
     assert all(item["source_run_id"] != created["id"] for item in feedback_samples_after)
+
+
+def test_external_data_service_normalizes_github_issues() -> None:
+    service = ExternalDataService(Settings(disable_llm=True))
+    service._fetch_json = lambda _url: [
+        {
+            "number": 101,
+            "title": "生产接口报错",
+            "body": "调用下游服务失败",
+            "html_url": "https://github.com/example/repo/issues/101",
+            "labels": [{"name": "bug"}],
+        }
+    ]
+    batch = service.load_support_tickets({"provider": "github_issues", "repo": "example/repo", "per_page": 1})
+    assert batch.provider == "github_issues"
+    assert batch.summary["repo"] == "example/repo"
+    assert batch.records[0]["customer"] == "example/repo"
+    assert batch.records[0]["source_id"] == "issue#101"
+
+
+def test_support_triage_can_use_external_ticket_source() -> None:
+    class FakeExternalData:
+        def load_support_tickets(self, source):
+            assert source["provider"] == "github_issues"
+            return ExternalTicketBatch(
+                provider="github_issues",
+                records=[
+                    {
+                        "customer": "example/repo",
+                        "message": "生产环境 outage",
+                        "body": "需要立即恢复",
+                        "source_id": "issue#9",
+                        "source_url": "https://example.invalid/9",
+                    }
+                ],
+                summary={"repo": "example/repo", "ticket_count": 1},
+            )
+
+    tool_center = ToolCenter(FakeExternalData())
+    result, call = tool_center.run(
+        WorkflowType.SUPPORT_TRIAGE,
+        {"data_source": {"provider": "github_issues", "repo": "example/repo"}},
+    )
+    assert call.name == "github_issues_tool"
+    assert result["data_source_summary"]["provider"] == "github_issues"
+    assert result["tickets"][0]["category"] == "incident"
+
+
+def test_llm_service_retries_until_schema_valid() -> None:
+    class FakeCompletions:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                content = json.dumps({"summary": "", "insights": [], "action_plan": []}, ensure_ascii=False)
+            else:
+                content = json.dumps(
+                    {
+                        "summary": "这是有效总结",
+                        "insights": ["发现一", "发现二"],
+                        "action_plan": ["动作一", "动作二"],
+                    },
+                    ensure_ascii=False,
+                )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+                usage=SimpleNamespace(prompt_tokens=12, completion_tokens=8, total_tokens=20),
+            )
+
+    llm_service = LLMService(Settings(api_key="fake-key", disable_llm=False))
+    llm_service._client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    profile = resolve_execution_profile(
+        default_model_name="qwen3-max",
+        prompt_profile=BUILTIN_PROMPT_PROFILES[0],
+        model_name_override="qwen3-max",
+        routing_policy_id="single-model-v1",
+    )
+    response = llm_service.generate_json(
+        route_target="analyst",
+        system_prompt="你是分析助手",
+        user_prompt="请输出 JSON",
+        fallback={"summary": "fallback", "insights": ["fallback"], "action_plan": ["fallback"]},
+        execution_profile=profile,
+        response_model=AnalystOutput,
+    )
+    assert response.payload["summary"] == "这是有效总结"
+    assert response.call.retry_count == 1
+    assert response.call.used_fallback is False
+
+
+def test_evaluation_dimensions_are_calculated() -> None:
+    run = WorkflowRun(
+        workflow_type=WorkflowType.SUPPORT_TRIAGE,
+        status=RunStatus.WAITING_HUMAN,
+        result={"raw_result": {}, "analysis": {}, "deliverables": {}, "review": {}},
+        review=ReviewDecision(
+            status=RunStatus.WAITING_HUMAN,
+            needs_human_review=True,
+            score=0.7,
+            reasons=["需要人工审核"],
+        ),
+    )
+    case = EvaluationCaseDefinition(
+        case_id="demo",
+        title="demo",
+        workflow_type="support_triage",
+        input_payload={},
+        expected_status="waiting_human",
+        expected_keywords=("review",),
+    )
+    dimensions = EvaluationService._score_dimensions(run, case)
+    assert set(dimensions) == {"status_match", "keyword_coverage", "result_completeness", "review_alignment"}
+    assert dimensions["status_match"] == 1.0
+    assert dimensions["result_completeness"] == 1.0

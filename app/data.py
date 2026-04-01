@@ -41,7 +41,13 @@ WORKFLOW_TEMPLATES = [
                     "customer": "星云教育",
                     "message": "请问可以提供开票流程和合同模板吗？",
                 },
-            ]
+            ],
+            "data_source": {
+                "provider": "github_issues",
+                "repo": "fastapi/fastapi",
+                "state": "open",
+                "per_page": 5,
+            },
         },
     ),
     WorkflowTemplate(

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from openai import OpenAI
+from pydantic import BaseModel, ValidationError
 
 from app.config import Settings
 from app.models import ExecutionProfile, LLMCall
@@ -37,6 +38,8 @@ class LLMService:
         user_prompt: str,
         fallback: dict[str, Any],
         execution_profile: ExecutionProfile,
+        response_model: type[BaseModel] | None = None,
+        max_retries: int = 2,
     ) -> LLMJsonResponse:
         model_name = execution_profile.model_routes.get(route_target, execution_profile.primary_model_name)
         if not self._client:
@@ -49,57 +52,99 @@ class LLMService:
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     latency_ms=0,
+                    retry_count=0,
                     used_fallback=True,
                     error="llm_disabled",
                 ),
             )
 
-        started_at = time.perf_counter()
-        try:
-            response = self._client.chat.completions.create(
-                model=model_name,
-                temperature=0.2,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            latency_ms = int((time.perf_counter() - started_at) * 1000)
-            content = response.choices[0].message.content or ""
-            parsed = self._extract_json(content)
-            usage = getattr(response, "usage", None)
-            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
-            completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
-            total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
-            call = self._build_call_trace(
-                route_target=route_target,
-                model_name=model_name,
-                execution_profile=execution_profile,
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                latency_ms=latency_ms,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-                used_fallback=parsed is None,
-                error=None if parsed is not None else "json_parse_failed",
-            )
-            return LLMJsonResponse(payload=parsed or fallback, call=call)
-        except Exception as exc:
-            latency_ms = int((time.perf_counter() - started_at) * 1000)
-            return LLMJsonResponse(
-                payload=fallback,
-                call=self._build_call_trace(
+        validation_error: str | None = None
+        total_latency_ms = 0
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        total_total_tokens = 0
+        final_error: str | None = None
+
+        for attempt in range(max_retries + 1):
+            started_at = time.perf_counter()
+            try:
+                effective_user_prompt = user_prompt
+                if attempt > 0:
+                    effective_user_prompt = (
+                        f"{user_prompt}\n\n上一次返回未通过结构化校验，请严格只返回合法 JSON，"
+                        f"并补全必填字段。校验错误：{validation_error or 'unknown'}"
+                    )
+                response = self._client.chat.completions.create(
+                    model=model_name,
+                    temperature=0.2,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": effective_user_prompt},
+                    ],
+                )
+                latency_ms = int((time.perf_counter() - started_at) * 1000)
+                total_latency_ms += latency_ms
+                content = response.choices[0].message.content or ""
+                parsed = self._extract_json(content)
+                usage = getattr(response, "usage", None)
+                prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+                completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+                total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+                total_prompt_tokens += prompt_tokens
+                total_completion_tokens += completion_tokens
+                total_total_tokens += total_tokens
+                if parsed is None:
+                    validation_error = "json_parse_failed"
+                    final_error = validation_error
+                    continue
+                if response_model is not None:
+                    try:
+                        parsed = response_model.model_validate(parsed).model_dump(mode="json")
+                    except ValidationError as exc:
+                        validation_error = str(exc)
+                        final_error = "schema_validation_failed"
+                        continue
+                validation_error = None
+                call = self._build_call_trace(
                     route_target=route_target,
                     model_name=model_name,
                     execution_profile=execution_profile,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
-                    latency_ms=latency_ms,
-                    used_fallback=True,
-                    error=f"{type(exc).__name__}: {exc}",
-                ),
-            )
+                    latency_ms=total_latency_ms,
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=total_completion_tokens,
+                    total_tokens=total_total_tokens,
+                    retry_count=attempt,
+                    used_fallback=False,
+                    validation_error=validation_error,
+                    error=None,
+                )
+                return LLMJsonResponse(payload=parsed, call=call)
+            except Exception as exc:
+                latency_ms = int((time.perf_counter() - started_at) * 1000)
+                total_latency_ms += latency_ms
+                final_error = f"{type(exc).__name__}: {exc}"
+                validation_error = None
+
+        return LLMJsonResponse(
+            payload=fallback,
+            call=self._build_call_trace(
+                route_target=route_target,
+                model_name=model_name,
+                execution_profile=execution_profile,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                latency_ms=total_latency_ms,
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+                total_tokens=total_total_tokens,
+                retry_count=max_retries,
+                used_fallback=True,
+                error=final_error,
+                validation_error=validation_error,
+            ),
+        )
 
     def _build_call_trace(
         self,
@@ -113,8 +158,10 @@ class LLMService:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,
+        retry_count: int = 0,
         used_fallback: bool = False,
         error: str | None = None,
+        validation_error: str | None = None,
     ) -> LLMCall:
         pricing = get_model_option(model_name)
         estimated_cost = round(
@@ -138,8 +185,10 @@ class LLMService:
             total_tokens=total_tokens,
             latency_ms=latency_ms,
             estimated_cost_usd=estimated_cost,
+            retry_count=retry_count,
             used_fallback=used_fallback,
             error=error,
+            validation_error=validation_error,
         )
 
     @staticmethod

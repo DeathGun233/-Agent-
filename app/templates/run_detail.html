@@ -68,7 +68,14 @@
         <div class="subtle">{{ log.timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S") }}</div>
         {% if log.tool_call %}<div class="badge">{{ log.tool_call.name }}</div>{% endif %}
         {% if log.llm_call %}
-        <div class="subtle">模型={{ log.llm_call.model_name }} · 路由={{ log.llm_call.route_target }} · 时延={{ log.llm_call.latency_ms }} 毫秒 · 成本=${{ log.llm_call.estimated_cost_usd }}</div>
+        <div class="subtle">
+          模型={{ log.llm_call.model_name }}
+          · 路由={{ log.llm_call.route_target }}
+          · 时延={{ log.llm_call.latency_ms }} 毫秒
+          · 成本=${{ log.llm_call.estimated_cost_usd }}
+          · 重试={{ log.llm_call.retry_count }}
+          {% if log.llm_call.validation_error %}· 校验={{ log.llm_call.validation_error }}{% endif %}
+        </div>
         {% endif %}
       </div>
       {% endfor %}

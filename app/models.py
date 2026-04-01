@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def utc_now() -> datetime:
@@ -77,8 +77,10 @@ class LLMCall(BaseModel):
     total_tokens: int = 0
     latency_ms: int = 0
     estimated_cost_usd: float = 0.0
+    retry_count: int = 0
     used_fallback: bool = False
     error: str | None = None
+    validation_error: str | None = None
 
 
 class WorkflowLog(BaseModel):
@@ -248,3 +250,81 @@ class FeedbackSample(BaseModel):
     expected_keywords: list[str] = Field(default_factory=list)
     output_snapshot: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
+
+
+def _normalize_text_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        raise ValueError("must be a list of strings")
+    normalized = [str(item).strip() for item in value if str(item).strip()]
+    if not normalized:
+        raise ValueError("must contain at least one non-empty item")
+    return normalized
+
+
+class AnalystOutput(BaseModel):
+    summary: str
+    insights: list[str]
+    action_plan: list[str]
+
+    @field_validator("summary")
+    @classmethod
+    def validate_summary(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("summary cannot be empty")
+        return normalized
+
+    @field_validator("insights", "action_plan", mode="before")
+    @classmethod
+    def validate_text_list(cls, value: Any) -> list[str]:
+        return _normalize_text_list(value)
+
+
+class ContentOutput(BaseModel):
+    deliverables: dict[str, Any]
+    manager_note: str
+
+    @field_validator("deliverables")
+    @classmethod
+    def validate_deliverables(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict) or not value:
+            raise ValueError("deliverables cannot be empty")
+        return value
+
+    @field_validator("manager_note")
+    @classmethod
+    def validate_manager_note(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("manager_note cannot be empty")
+        return normalized
+
+
+class ReviewOutput(BaseModel):
+    status: Literal["completed", "waiting_human"]
+    needs_human_review: bool
+    score: float
+    reasons: list[str]
+
+    @field_validator("score")
+    @classmethod
+    def validate_score(cls, value: float) -> float:
+        numeric = float(value)
+        if not 0.0 <= numeric <= 1.0:
+            raise ValueError("score must be between 0 and 1")
+        return numeric
+
+    @field_validator("reasons", mode="before")
+    @classmethod
+    def validate_reasons(cls, value: Any) -> list[str]:
+        return _normalize_text_list(value)
+
+    @model_validator(mode="after")
+    def align_status(self) -> "ReviewOutput":
+        if self.status == "waiting_human":
+            self.needs_human_review = True
+        else:
+            self.needs_human_review = False
+        return self
