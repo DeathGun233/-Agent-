@@ -132,16 +132,17 @@ def _build_llm_summary(run: WorkflowRun) -> dict[str, object]:
             "total_cost_usd": 0.0,
             "fallback_requests": 0,
         }
-    total_latency_ms = sum(call.latency_ms for call in llm_calls)
+    real_llm_calls = [call for call in llm_calls if not call.used_fallback]
+    total_latency_ms = sum(call.latency_ms for call in real_llm_calls)
     return {
-        "total_requests": len(llm_calls),
-        "model_names": sorted({call.model_name for call in llm_calls}),
-        "prompt_tokens": sum(call.prompt_tokens for call in llm_calls),
-        "completion_tokens": sum(call.completion_tokens for call in llm_calls),
-        "total_tokens": sum(call.total_tokens for call in llm_calls),
+        "total_requests": len(real_llm_calls),
+        "model_names": sorted({call.model_name for call in real_llm_calls}),
+        "prompt_tokens": sum(call.prompt_tokens for call in real_llm_calls),
+        "completion_tokens": sum(call.completion_tokens for call in real_llm_calls),
+        "total_tokens": sum(call.total_tokens for call in real_llm_calls),
         "total_latency_ms": total_latency_ms,
-        "avg_latency_ms": round(total_latency_ms / len(llm_calls), 1),
-        "total_cost_usd": round(sum(call.estimated_cost_usd for call in llm_calls), 6),
+        "avg_latency_ms": round(total_latency_ms / len(real_llm_calls), 1) if real_llm_calls else 0,
+        "total_cost_usd": round(sum(call.estimated_cost_usd for call in real_llm_calls), 6),
         "fallback_requests": sum(1 for call in llm_calls if call.used_fallback),
     }
 
@@ -535,12 +536,16 @@ def delete_run_form(run_id: str, request: Request):
 
 
 @app.post("/runs/bulk-delete")
-def bulk_delete_runs_form(request: Request, run_ids: list[str] = Form(default_factory=list)):
+def bulk_delete_runs_form(
+    request: Request,
+    run_ids: list[str] = Form(default_factory=list),
+    next_url: str = Form("/runs"),
+):
     user = _page_user(request, {ROLE_OPERATOR, ROLE_REVIEWER, ROLE_ADMIN})
     if user is None:
         return _redirect_to_login(request)
     engine.delete_runs(run_ids)
-    return RedirectResponse(url="/runs", status_code=303)
+    return RedirectResponse(url=_safe_next_path(next_url), status_code=303)
 
 
 @app.get("/reviews", response_class=HTMLResponse)
@@ -548,10 +553,17 @@ def reviews_page(request: Request):
     user = _page_user(request, {ROLE_REVIEWER, ROLE_ADMIN})
     if user is None:
         return _redirect_to_login(request)
+    review_queue = _build_run_rows(engine.list_waiting_human())
     return _template_response(
         request,
         "reviews.html",
-        _common_context(request, user, "reviews", review_queue=_build_run_rows(engine.list_waiting_human())),
+        _common_context(
+            request,
+            user,
+            "reviews",
+            review_queue=review_queue,
+            filtered_count=len(review_queue),
+        ),
     )
 
 
