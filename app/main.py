@@ -29,7 +29,14 @@ from app.reporting import (
     build_workflow_pdf,
 )
 from app.repository import WorkflowRepository
-from app.services import BatchExperimentService, CostAnalyticsService, EvaluationService, WorkflowEngine
+from app.services import (
+    BatchExperimentService,
+    CostAnalyticsService,
+    EvaluationService,
+    WorkflowEngine,
+    fallback_request_count_from_run,
+    real_llm_calls_from_run,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -204,7 +211,8 @@ def _compare_summary() -> dict[str, object]:
         grouped.setdefault(key, []).append(run)
 
     for (workflow_type, model_name, prompt_id), group in grouped.items():
-        llm_calls = [log.llm_call for run in group for log in run.logs if log.llm_call]
+        llm_calls = [call for run in group for call in real_llm_calls_from_run(run)]
+        fallback_requests = sum(fallback_request_count_from_run(run) for run in group)
         prompt_profile = group[0].result.get("execution_profile", {}).get("prompt_profile", {})
         routing_policy = group[0].result.get("execution_profile", {}).get("routing_policy", {})
         rows.append(
@@ -218,6 +226,7 @@ def _compare_summary() -> dict[str, object]:
                 "avg_score": round(sum(run.review.score for run in group if run.review) / max(sum(1 for run in group if run.review), 1), 3),
                 "avg_latency_ms": round(sum(call.latency_ms for call in llm_calls) / max(len(llm_calls), 1), 1) if llm_calls else 0.0,
                 "avg_cost_usd": round(sum(call.estimated_cost_usd for call in llm_calls) / max(len(llm_calls), 1), 6) if llm_calls else 0.0,
+                "fallback_requests": fallback_requests,
                 "handoff_rate": round(sum(1 for run in group if run.status.value == "waiting_human") / len(group) * 100, 1),
             }
         )

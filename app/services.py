@@ -71,13 +71,22 @@ def llm_calls_from_run(run: WorkflowRun) -> list[Any]:
     return [log.llm_call for log in run.logs if log.llm_call is not None]
 
 
+def real_llm_calls_from_run(run: WorkflowRun) -> list[Any]:
+    return [call for call in llm_calls_from_run(run) if not call.used_fallback]
+
+
+def fallback_request_count_from_run(run: WorkflowRun) -> int:
+    return sum(1 for call in llm_calls_from_run(run) if call.used_fallback)
+
+
 def summarize_run_metrics(run: WorkflowRun) -> dict[str, float | int]:
-    llm_calls = llm_calls_from_run(run)
+    llm_calls = real_llm_calls_from_run(run)
     return {
         "cost_usd": round(sum(call.estimated_cost_usd for call in llm_calls), 6),
         "latency_ms": sum(call.latency_ms for call in llm_calls),
         "tokens": sum(call.total_tokens for call in llm_calls),
         "llm_calls": len(llm_calls),
+        "fallback_requests": fallback_request_count_from_run(run),
     }
 
 
@@ -1797,7 +1806,8 @@ class CostAnalyticsService:
             run for run in runs
             if run.created_at.year == now.year and run.created_at.month == now.month
         ]
-        month_calls = [call for run in monthly_runs for call in llm_calls_from_run(run)]
+        month_calls = [call for run in monthly_runs for call in real_llm_calls_from_run(run)]
+        fallback_requests = sum(fallback_request_count_from_run(run) for run in monthly_runs)
         total_cost = round(sum(call.estimated_cost_usd for call in month_calls), 6)
         total_tokens = sum(call.total_tokens for call in month_calls)
         total_latency_ms = sum(call.latency_ms for call in month_calls)
@@ -1865,6 +1875,7 @@ class CostAnalyticsService:
             "daily_cost_rows": [{"day": key, "cost_usd": round(value, 6)} for key, value in sorted(by_day.items())],
             "run_count": len(monthly_runs),
             "llm_call_count": len(month_calls),
+            "fallback_requests": fallback_requests,
             "alert_level": alert_level,
             "alert_title": alert_title,
             "alert_message": alert_message,

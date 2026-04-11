@@ -62,6 +62,7 @@ def build_workflow_markdown(run: WorkflowRun, llm_summary: dict[str, Any], resul
         "",
         "## AI 指标",
         f"- 模型调用次数：{llm_summary['total_requests']}",
+        f"- 降级执行次数：{llm_summary['fallback_requests']}",
         f"- 累计 Tokens：{llm_summary['total_tokens']}",
         f"- 平均耗时：{llm_summary['avg_latency_ms']} 毫秒",
         f"- 累计成本：${llm_summary['total_cost_usd']}",
@@ -121,6 +122,7 @@ def build_workflow_html(run: WorkflowRun, llm_summary: dict[str, Any], result_js
       <h2>AI 指标</h2>
       <ul>
         <li>模型调用次数：{llm_summary['total_requests']}</li>
+        <li>降级执行次数：{llm_summary['fallback_requests']}</li>
         <li>累计 Tokens：{llm_summary['total_tokens']}</li>
         <li>平均耗时：{llm_summary['avg_latency_ms']} 毫秒</li>
         <li>累计成本：${llm_summary['total_cost_usd']}</li>
@@ -151,6 +153,7 @@ def build_workflow_pdf(run: WorkflowRun, llm_summary: dict[str, Any], result_jso
         f"状态：{_status_label(run.status.value)}",
         f"当前节点：{run.current_step}",
         f"模型调用次数：{llm_summary['total_requests']}",
+        f"降级执行次数：{llm_summary['fallback_requests']}",
         f"累计 Tokens：{llm_summary['total_tokens']}",
         f"平均耗时：{llm_summary['avg_latency_ms']} 毫秒",
         f"累计成本：${llm_summary['total_cost_usd']}",

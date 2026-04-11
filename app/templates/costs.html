@@ -3,7 +3,7 @@
 <div class="header">
   <div>
     <h1>成本看板</h1>
-    <p>按月查看模型消耗、预算进度、阈值预警和成本趋势。</p>
+    <p>按月查看真实模型消耗、预算进度、阈值预警和成本趋势。</p>
   </div>
 </div>
 
@@ -25,14 +25,14 @@
 
 <div class="grid three">
   <div class="card">
-    <div class="subtle">本月成本</div>
+    <div class="subtle">本月真实成本</div>
     <div class="metric">${{ summary.total_cost_usd }}</div>
     <div class="subtle">{{ summary.month }}</div>
   </div>
   <div class="card">
-    <div class="subtle">预算占用</div>
-    <div class="metric">{{ summary.spend_ratio_percent }}%</div>
-    <div class="subtle">月预算：${{ summary.monthly_budget_usd }}</div>
+    <div class="subtle">真实模型调用</div>
+    <div class="metric">{{ summary.llm_call_count }}</div>
+    <div class="subtle">降级执行：{{ summary.fallback_requests }}</div>
   </div>
   <div class="card">
     <div class="subtle">月末预计成本</div>
@@ -50,15 +50,15 @@
       <div>
         <div style="display:flex;justify-content:space-between;gap:12px;">
           <strong>{{ row.model_name }}</strong>
-          <span class="subtle">${{ row.cost_usd }} · {{ row.requests }} 次</span>
+          <span class="subtle">${{ row.cost_usd }} / {{ row.requests }} 次</span>
         </div>
         <div style="height:12px;border-radius:999px;background:rgba(0,0,0,.06);overflow:hidden;margin-top:8px;">
           <div style="height:100%;width:{{ (row.cost_usd / max_model_cost * 100) if max_model_cost else 0 }}%;background:linear-gradient(90deg,#1d1b18,#b64c2d);"></div>
         </div>
-        <div class="subtle" style="margin-top:6px;">Tokens：{{ row.tokens }} · 平均时延：{{ row.avg_latency_ms }} 毫秒</div>
+        <div class="subtle" style="margin-top:6px;">Tokens：{{ row.tokens }} / 平均时延：{{ row.avg_latency_ms }} 毫秒</div>
       </div>
       {% else %}
-      <div class="subtle">本月还没有模型调用记录。</div>
+      <div class="subtle">本月还没有真实模型调用记录。</div>
       {% endfor %}
     </div>
   </section>

@@ -2,10 +2,12 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from app.config import Settings
 from app.db import UserAccountRecord
 from app.main import _build_llm_summary, app, database
 from app.models import LLMCall, WorkflowLog, WorkflowRun, WorkflowType
-from app.services import ReviewerAgent
+from app.reporting import build_workflow_markdown
+from app.services import CostAnalyticsService, ReviewerAgent
 
 
 client = TestClient(app)
@@ -414,3 +416,74 @@ def test_llm_summary_counts_only_real_model_calls_and_separates_fallbacks() -> N
     assert summary["fallback_requests"] == 1
     assert summary["total_tokens"] == 150
     assert summary["total_cost_usd"] == 0.012
+
+
+def test_workflow_markdown_report_includes_fallback_requests() -> None:
+    run = WorkflowRun(workflow_type=WorkflowType.SALES_FOLLOWUP, objective="test objective")
+    run.logs = [
+        WorkflowLog(
+            agent="PlannerAgent",
+            message="fallback",
+            llm_call=LLMCall(
+                model_name="qwen3-max",
+                route_target="planner",
+                system_prompt="s",
+                user_prompt="u",
+                used_fallback=True,
+                error="llm_disabled",
+            ),
+        )
+    ]
+    summary = _build_llm_summary(run)
+
+    markdown = build_workflow_markdown(run, summary, "{}")
+
+    assert "降级执行次数" in markdown
+    assert "1" in markdown
+
+
+def test_cost_summary_excludes_fallback_calls_and_tracks_them_separately() -> None:
+    run = WorkflowRun(workflow_type=WorkflowType.SALES_FOLLOWUP)
+    run.logs = [
+        WorkflowLog(
+            agent="PlannerAgent",
+            message="fallback",
+            llm_call=LLMCall(
+                model_name="qwen3-max",
+                route_target="planner",
+                system_prompt="s",
+                user_prompt="u",
+                used_fallback=True,
+                error="llm_disabled",
+                estimated_cost_usd=0.99,
+                total_tokens=999,
+                latency_ms=999,
+            ),
+        ),
+        WorkflowLog(
+            agent="AnalystAgent",
+            message="real",
+            llm_call=LLMCall(
+                model_name="qwen3-max",
+                route_target="analyst",
+                system_prompt="s",
+                user_prompt="u",
+                prompt_tokens=120,
+                completion_tokens=30,
+                total_tokens=150,
+                latency_ms=900,
+                estimated_cost_usd=0.012,
+            ),
+        ),
+    ]
+
+    class Repo:
+        def list_all(self):
+            return [run]
+
+    summary = CostAnalyticsService(Repo(), Settings()).build_summary()
+
+    assert summary["total_cost_usd"] == 0.012
+    assert summary["total_tokens"] == 150
+    assert summary["llm_call_count"] == 1
+    assert summary["fallback_requests"] == 1
