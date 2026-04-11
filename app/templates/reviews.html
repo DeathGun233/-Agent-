@@ -3,34 +3,106 @@
 <div class="header">
   <div>
     <h1>审核中心</h1>
-    <p>查看所有待人工复核的任务，并进入详情页完成审核。</p>
+    <p>查看所有待人工审核任务，支持批量勾选后直接删除。</p>
   </div>
 </div>
 
+<section class="card" style="margin-bottom:18px;">
+  <div class="subtle">当前待审核记录共 {{ filtered_count }} 条。</div>
+</section>
+
 <section class="card">
+  <form method="post" action="/runs/bulk-delete" id="bulk-delete-form" onsubmit="return confirmBulkDelete();" style="margin-bottom:16px;">
+    <input type="hidden" name="next_url" value="/reviews">
+    <div class="toolbar">
+      <button type="button" class="ghost" onclick="toggleAllRuns(true)">全选</button>
+      <button type="button" class="ghost" onclick="toggleAllRuns(false)">取消全选</button>
+      <button type="submit" class="secondary" id="bulk-delete-button" disabled>删除已选记录</button>
+      <span class="subtle" id="selected-run-count">当前未选中记录</span>
+    </div>
+  </form>
+
   <table>
     <thead>
       <tr>
+        <th style="width:52px;">选择</th>
         <th>工作流</th>
         <th>状态</th>
         <th>模型</th>
         <th>Prompt</th>
         <th>更新时间</th>
+        <th>操作</th>
       </tr>
     </thead>
     <tbody>
       {% for row in review_queue %}
       <tr>
-        <td><a href="/runs/{{ row.id }}"><strong>{{ row.title }}</strong></a><div class="subtle">{{ row.objective }}</div></td>
+        <td>
+          <input
+            type="checkbox"
+            name="run_ids"
+            value="{{ row.id }}"
+            class="run-checkbox"
+            form="bulk-delete-form"
+            onchange="updateBulkDeleteState()"
+          >
+        </td>
+        <td>
+          <a href="/runs/{{ row.id }}"><strong>{{ row.title }}</strong></a>
+          <div class="subtle">{{ row.objective }}</div>
+        </td>
         <td><span class="badge status-{{ row.status }}">{{ status_label(row.status) }}</span></td>
         <td>{{ row.model_name }}</td>
         <td>{{ row.prompt_profile_label }}</td>
         <td>{{ row.updated_at }}</td>
+        <td>
+          <div class="toolbar">
+            <a class="badge" href="/runs/{{ row.id }}">查看</a>
+            <form method="post" action="/runs/{{ row.id }}/delete" onsubmit="return confirm('确认删除这条待审核记录吗？');">
+              <button type="submit" class="secondary">删除</button>
+            </form>
+          </div>
+        </td>
       </tr>
       {% else %}
-      <tr><td colspan="5" class="subtle">当前没有待审核任务。</td></tr>
+      <tr><td colspan="7" class="subtle">当前没有待人工审核任务。</td></tr>
       {% endfor %}
     </tbody>
   </table>
 </section>
+
+<script>
+  function selectedRunCount() {
+    return document.querySelectorAll(".run-checkbox:checked").length;
+  }
+
+  function updateBulkDeleteState() {
+    const count = selectedRunCount();
+    const button = document.getElementById("bulk-delete-button");
+    const label = document.getElementById("selected-run-count");
+    if (button) {
+      button.disabled = count === 0;
+    }
+    if (label) {
+      label.textContent = count > 0 ? `已选中 ${count} 条记录` : "当前未选中记录";
+    }
+  }
+
+  function toggleAllRuns(checked) {
+    document.querySelectorAll(".run-checkbox").forEach((checkbox) => {
+      checkbox.checked = checked;
+    });
+    updateBulkDeleteState();
+  }
+
+  function confirmBulkDelete() {
+    const count = selectedRunCount();
+    if (count === 0) {
+      return false;
+    }
+    return confirm(`确认批量删除已选中的 ${count} 条待审核记录吗？`);
+  }
+
+  updateBulkDeleteState();
+</script>
 {% endblock %}

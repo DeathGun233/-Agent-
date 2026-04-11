@@ -1,0 +1,8 @@
+{
+  "database_url": "sqlite:///flowpilot.db",
+  "mode": "dry-run",
+  "candidate_count": 0,
+  "reason_counts": {},
+  "candidate_ids": [],
+  "rows": []
+}
