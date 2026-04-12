@@ -6,7 +6,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from statistics import mean
-from typing import Any, TypedDict
+from typing import Any, Callable, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -22,6 +22,7 @@ from app.models import (
     EvaluationRun,
     ExecutionProfile,
     FeedbackSample,
+    OperatorDecision,
     PromptProfile,
     PromptProfileForm,
     ReviewDecision,
@@ -58,6 +59,9 @@ class WorkflowState(TypedDict, total=False):
     execution_profile: ExecutionProfile
     prompt_profile: PromptProfile
     planning_context: dict[str, Any]
+    operator_context: dict[str, Any]
+    analyst_context: dict[str, Any]
+    reviewer_context: dict[str, Any]
     raw_result: dict[str, Any]
     analysis: dict[str, Any]
     deliverables: dict[str, Any]
@@ -69,13 +73,22 @@ def llm_calls_from_run(run: WorkflowRun) -> list[Any]:
     return [log.llm_call for log in run.logs if log.llm_call is not None]
 
 
+def real_llm_calls_from_run(run: WorkflowRun) -> list[Any]:
+    return [call for call in llm_calls_from_run(run) if not call.used_fallback]
+
+
+def fallback_request_count_from_run(run: WorkflowRun) -> int:
+    return sum(1 for call in llm_calls_from_run(run) if call.used_fallback)
+
+
 def summarize_run_metrics(run: WorkflowRun) -> dict[str, float | int]:
-    llm_calls = llm_calls_from_run(run)
+    llm_calls = real_llm_calls_from_run(run)
     return {
         "cost_usd": round(sum(call.estimated_cost_usd for call in llm_calls), 6),
         "latency_ms": sum(call.latency_ms for call in llm_calls),
         "tokens": sum(call.total_tokens for call in llm_calls),
         "llm_calls": len(llm_calls),
+        "fallback_requests": fallback_request_count_from_run(run),
     }
 
 
@@ -87,19 +100,101 @@ class EvaluationDatasetRuntime:
     cases: list[EvaluationCaseDefinition]
 
 
+@dataclass(frozen=True)
+class AgentTool:
+    name: str
+    description: str
+    workflows: tuple[WorkflowType, ...]
+    handler: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class OperatorExecutionResult:
+    raw_result: dict[str, Any]
+    operator_context: dict[str, Any]
+    events: list[dict[str, Any]]
+
+
 class AgentMemoryService:
-    def __init__(self, repository: WorkflowRepository) -> None:
+    def __init__(self, repository: WorkflowRepository, settings: Settings) -> None:
         self.repository = repository
+        self.settings = settings
+
+    def _related_runs(self, workflow_type: WorkflowType, limit: int) -> list[WorkflowRun]:
+        return [
+            run for run in self.repository.list_all()
+            if run.workflow_type == workflow_type and run.result
+        ][:limit]
+
+    def _related_feedback(self, workflow_type: WorkflowType, limit: int) -> list[FeedbackSample]:
+        return [
+            sample for sample in self.repository.list_feedback_samples()
+            if sample.workflow_type == workflow_type
+        ][:limit]
+
+    @staticmethod
+    def _execution_profile_id(payload: dict[str, Any]) -> str | None:
+        execution_profile = payload.get("execution_profile", {})
+        if not isinstance(execution_profile, dict):
+            return None
+        prompt_profile = execution_profile.get("prompt_profile", {})
+        if not isinstance(prompt_profile, dict):
+            return None
+        profile_id = prompt_profile.get("profile_id")
+        return str(profile_id) if profile_id else None
+
+    def _matching_runs(
+        self,
+        workflow_type: WorkflowType,
+        *,
+        prompt_profile_id: str,
+        limit: int,
+    ) -> list[WorkflowRun]:
+        preferred: list[WorkflowRun] = []
+        fallback: list[WorkflowRun] = []
+        for run in self.repository.list_all():
+            if run.workflow_type != workflow_type or not run.result:
+                continue
+            result = run.result if isinstance(run.result, dict) else {}
+            if self._execution_profile_id(result) == prompt_profile_id:
+                preferred.append(run)
+            else:
+                fallback.append(run)
+        return (preferred + fallback)[:limit]
+
+    def _matching_feedback(
+        self,
+        workflow_type: WorkflowType,
+        *,
+        prompt_profile_id: str,
+        limit: int,
+    ) -> list[FeedbackSample]:
+        preferred: list[FeedbackSample] = []
+        fallback: list[FeedbackSample] = []
+        for sample in self.repository.list_feedback_samples():
+            if sample.workflow_type != workflow_type:
+                continue
+            if self._execution_profile_id(sample.output_snapshot) == prompt_profile_id:
+                preferred.append(sample)
+            else:
+                fallback.append(sample)
+        return (preferred + fallback)[:limit]
+
+    @staticmethod
+    def memory_hits(memory: dict[str, Any]) -> int:
+        return len(memory.get("recent_runs", [])) + len(memory.get("feedback_samples", []))
 
     def planner_memory(self, request: WorkflowRequest, *, run_limit: int = 3, feedback_limit: int = 3) -> dict[str, Any]:
-        related_runs = [
-            run for run in self.repository.list_all()
-            if run.workflow_type == request.workflow_type and run.result
-        ][:run_limit]
-        related_feedback = [
-            sample for sample in self.repository.list_feedback_samples()
-            if sample.workflow_type == request.workflow_type
-        ][:feedback_limit]
+        if not self.settings.enable_runtime_memory:
+            return {
+                "enabled": False,
+                "recent_runs": [],
+                "feedback_samples": [],
+                "dominant_keywords": [],
+                "common_review_reasons": [],
+            }
+        related_runs = self._related_runs(request.workflow_type, run_limit)
+        related_feedback = self._related_feedback(request.workflow_type, feedback_limit)
 
         keyword_counter: Counter[str] = Counter()
         review_reason_counter: Counter[str] = Counter()
@@ -136,10 +231,184 @@ class AgentMemoryService:
             )
 
         return {
+            "enabled": True,
             "recent_runs": run_rows,
             "feedback_samples": feedback_rows,
             "dominant_keywords": [item for item, _ in keyword_counter.most_common(6)],
             "common_review_reasons": [item for item, _ in review_reason_counter.most_common(4)],
+        }
+
+    def operator_memory(self, request: WorkflowRequest, *, run_limit: int = 4, feedback_limit: int = 3) -> dict[str, Any]:
+        if not self.settings.enable_runtime_memory:
+            return {
+                "enabled": False,
+                "recent_runs": [],
+                "common_tools": [],
+                "feedback_samples": [],
+            }
+        related_runs = self._related_runs(request.workflow_type, run_limit)
+        related_feedback = self._related_feedback(request.workflow_type, feedback_limit)
+        tool_counter: Counter[str] = Counter()
+        run_rows = []
+        for run in related_runs:
+            operator_tools = [
+                log.tool_call.name for log in run.logs
+                if log.agent == "OperatorAgent" and log.tool_call is not None
+            ]
+            tool_counter.update(operator_tools)
+            run_rows.append(
+                {
+                    "run_id": run.id,
+                    "status": run.status.value,
+                    "tool_names": operator_tools,
+                    "updated_at": run.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+
+        feedback_rows = [
+            {
+                "sample_id": sample.id,
+                "comment": sample.reviewer_comment,
+                "expected_status": sample.expected_status.value,
+                "keywords": sample.expected_keywords[:5],
+            }
+            for sample in related_feedback
+        ]
+
+        return {
+            "enabled": True,
+            "recent_runs": run_rows,
+            "common_tools": [item for item, _ in tool_counter.most_common(6)],
+            "feedback_samples": feedback_rows,
+        }
+
+    def analyst_memory(
+        self,
+        request: WorkflowRequest,
+        *,
+        prompt_profile: PromptProfile,
+        run_limit: int = 3,
+        feedback_limit: int = 2,
+    ) -> dict[str, Any]:
+        if not self.settings.enable_runtime_memory:
+            return {
+                "enabled": False,
+                "recent_runs": [],
+                "feedback_samples": [],
+                "prompt_profile_id": prompt_profile.profile_id,
+                "highlight_keywords": [],
+            }
+        related_runs = self._matching_runs(
+            request.workflow_type,
+            prompt_profile_id=prompt_profile.profile_id,
+            limit=run_limit,
+        )
+        related_feedback = self._matching_feedback(
+            request.workflow_type,
+            prompt_profile_id=prompt_profile.profile_id,
+            limit=feedback_limit,
+        )
+        keyword_counter: Counter[str] = Counter()
+        run_rows = []
+        for run in related_runs:
+            result = run.result if isinstance(run.result, dict) else {}
+            analysis = result.get("analysis", {}) if isinstance(result.get("analysis", {}), dict) else {}
+            review = result.get("review", {}) if isinstance(result.get("review", {}), dict) else {}
+            run_rows.append(
+                {
+                    "run_id": run.id,
+                    "status": run.status.value,
+                    "summary": analysis.get("summary", ""),
+                    "insights": [str(item) for item in analysis.get("insights", [])[:3]],
+                    "review_reasons": [str(item) for item in review.get("reasons", [])[:2]],
+                    "prompt_profile_id": self._execution_profile_id(result),
+                    "updated_at": run.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        feedback_rows = []
+        for sample in related_feedback:
+            keywords = [str(item).strip() for item in sample.expected_keywords if str(item).strip()]
+            keyword_counter.update(keywords)
+            feedback_rows.append(
+                {
+                    "sample_id": sample.id,
+                    "comment": sample.reviewer_comment,
+                    "keywords": keywords[:5],
+                    "expected_status": sample.expected_status.value,
+                    "prompt_profile_id": self._execution_profile_id(sample.output_snapshot),
+                }
+            )
+        return {
+            "enabled": True,
+            "prompt_profile_id": prompt_profile.profile_id,
+            "recent_runs": run_rows,
+            "feedback_samples": feedback_rows,
+            "highlight_keywords": [item for item, _ in keyword_counter.most_common(5)],
+        }
+
+    def reviewer_memory(
+        self,
+        request: WorkflowRequest,
+        *,
+        prompt_profile: PromptProfile,
+        run_limit: int = 3,
+        feedback_limit: int = 3,
+    ) -> dict[str, Any]:
+        if not self.settings.enable_runtime_memory:
+            return {
+                "enabled": False,
+                "recent_runs": [],
+                "feedback_samples": [],
+                "prompt_profile_id": prompt_profile.profile_id,
+                "common_expected_statuses": [],
+            }
+        related_runs = self._matching_runs(
+            request.workflow_type,
+            prompt_profile_id=prompt_profile.profile_id,
+            limit=run_limit,
+        )
+        related_feedback = self._matching_feedback(
+            request.workflow_type,
+            prompt_profile_id=prompt_profile.profile_id,
+            limit=feedback_limit,
+        )
+        status_counter: Counter[str] = Counter()
+        run_rows = []
+        for run in related_runs:
+            result = run.result if isinstance(run.result, dict) else {}
+            review = result.get("review", {}) if isinstance(result.get("review", {}), dict) else {}
+            status = str(review.get("status", run.status.value))
+            status_counter.update([status])
+            run_rows.append(
+                {
+                    "run_id": run.id,
+                    "status": run.status.value,
+                    "review_status": status,
+                    "review_score": review.get("score"),
+                    "review_reasons": [str(item) for item in review.get("reasons", [])[:3]],
+                    "prompt_profile_id": self._execution_profile_id(result),
+                    "updated_at": run.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        feedback_rows = []
+        for sample in related_feedback:
+            status_counter.update([sample.expected_status.value])
+            feedback_rows.append(
+                {
+                    "sample_id": sample.id,
+                    "comment": sample.reviewer_comment,
+                    "keywords": [str(item) for item in sample.expected_keywords[:5]],
+                    "expected_status": sample.expected_status.value,
+                    "review_score": sample.review_score,
+                    "prompt_profile_id": self._execution_profile_id(sample.output_snapshot),
+                }
+            )
+        return {
+            "enabled": True,
+            "prompt_profile_id": prompt_profile.profile_id,
+            "recent_runs": run_rows,
+            "feedback_samples": feedback_rows,
+            "common_expected_statuses": [item for item, _ in status_counter.most_common(4)],
         }
 
 
@@ -460,6 +729,348 @@ class ToolCenter:
         }
 
 
+class OperatorToolbox:
+    def __init__(self, external_data: ExternalDataService) -> None:
+        self.external_data = external_data
+        self.legacy_tool_center = ToolCenter(external_data)
+        self.tools = {
+            tool.name: tool
+            for tool in [
+                AgentTool(
+                    name="sales_pipeline_metrics_tool",
+                    description="读取销售样本数据并计算线索、成交、转化率和销售周期。",
+                    workflows=(WorkflowType.SALES_FOLLOWUP,),
+                    handler=self._sales_pipeline_metrics,
+                ),
+                AgentTool(
+                    name="sales_risk_lookup_tool",
+                    description="提取风险客户、负责人和下一步动作建议。",
+                    workflows=(WorkflowType.SALES_FOLLOWUP,),
+                    handler=self._sales_risk_lookup,
+                ),
+                AgentTool(
+                    name="marketing_brief_tool",
+                    description="整理产品、受众、渠道、卖点和语气等投放简报信息。",
+                    workflows=(WorkflowType.MARKETING_CAMPAIGN,),
+                    handler=self._marketing_brief,
+                ),
+                AgentTool(
+                    name="marketing_compliance_tool",
+                    description="补充合规风险和各渠道发布提示。",
+                    workflows=(WorkflowType.MARKETING_CAMPAIGN,),
+                    handler=self._marketing_compliance,
+                ),
+                AgentTool(
+                    name="support_source_loader_tool",
+                    description="加载外部工单数据，或回退到请求中的 tickets。",
+                    workflows=(WorkflowType.SUPPORT_TRIAGE,),
+                    handler=self._support_source_loader,
+                ),
+                AgentTool(
+                    name="support_classifier_tool",
+                    description="对客服工单做分类、优先级判断和事件升级识别。",
+                    workflows=(WorkflowType.SUPPORT_TRIAGE,),
+                    handler=self._support_classifier,
+                ),
+                AgentTool(
+                    name="meeting_action_items_tool",
+                    description="从会议纪要中提取负责人、行动项和跟进节点。",
+                    workflows=(WorkflowType.MEETING_MINUTES,),
+                    handler=self._meeting_action_items,
+                ),
+                AgentTool(
+                    name="meeting_summary_points_tool",
+                    description="提取会议标题和摘要要点，便于后续生成总结。",
+                    workflows=(WorkflowType.MEETING_MINUTES,),
+                    handler=self._meeting_summary_points,
+                ),
+            ]
+        }
+
+    def available_tools(self, workflow_type: WorkflowType) -> list[AgentTool]:
+        return [tool for tool in self.tools.values() if workflow_type in tool.workflows]
+
+    def execute(self, tool_name: str, payload: dict[str, Any], observation: dict[str, Any]) -> tuple[dict[str, Any], ToolCall]:
+        tool = self.tools[tool_name]
+        tool_input = dict(payload)
+        if observation:
+            tool_input["observation"] = observation
+        output = tool.handler(payload, observation)
+        return output, ToolCall(name=tool.name, input=tool_input, output=output)
+
+    def fallback_sequence(self, workflow_type: WorkflowType, payload: dict[str, Any]) -> list[str]:
+        if workflow_type == WorkflowType.SALES_FOLLOWUP:
+            return ["sales_pipeline_metrics_tool", "sales_risk_lookup_tool"]
+        if workflow_type == WorkflowType.MARKETING_CAMPAIGN:
+            return ["marketing_brief_tool", "marketing_compliance_tool"]
+        if workflow_type == WorkflowType.SUPPORT_TRIAGE:
+            sequence = ["support_classifier_tool"]
+            if isinstance(payload.get("data_source"), dict) and payload.get("data_source", {}).get("provider"):
+                sequence.insert(0, "support_source_loader_tool")
+            return sequence
+        return ["meeting_action_items_tool", "meeting_summary_points_tool"]
+
+    def finalize(self, workflow_type: WorkflowType, payload: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
+        if workflow_type == WorkflowType.SALES_FOLLOWUP:
+            return {
+                "focus_metric": observation.get("focus_metric", payload.get("focus_metric", "conversion_rate")),
+                "period": observation.get("period", payload.get("period", "current")),
+                "region": observation.get("region", payload.get("region", "all") or "all"),
+                "lead_count": observation.get("lead_count", 0),
+                "qualified_leads": observation.get("qualified_leads", 0),
+                "deals": observation.get("deals", 0),
+                "conversion_rate": observation.get("conversion_rate", 0.0),
+                "avg_cycle_days": observation.get("avg_cycle_days", 0.0),
+                "risk_customers": observation.get("risk_customers", []),
+            }
+        if workflow_type == WorkflowType.MARKETING_CAMPAIGN:
+            return {
+                "product_name": observation.get("product_name", payload.get("product_name", "目标产品")),
+                "audience": observation.get("audience", payload.get("audience", "目标人群")),
+                "channels": observation.get("channels", payload.get("channels", ["xiaohongshu"])),
+                "key_benefits": observation.get("key_benefits", payload.get("key_benefits", [])),
+                "tone": observation.get("tone", payload.get("tone", "清晰直接")),
+                "compliance_risks": observation.get("compliance_risks", []),
+                "channel_notes": observation.get("channel_notes", {}),
+            }
+        if workflow_type == WorkflowType.SUPPORT_TRIAGE:
+            return {
+                "tickets": observation.get("tickets", []),
+                "high_priority_count": observation.get("high_priority_count", 0),
+                "requires_incident_handoff": observation.get("requires_incident_handoff", False),
+                "data_source_summary": observation.get("data_source_summary", {}),
+            }
+        return {
+            "meeting_title": observation.get("meeting_title", payload.get("meeting_title", "会议")),
+            "action_items": observation.get("action_items", []),
+            "owner_count": observation.get("owner_count", 0),
+            "summary_points": observation.get("summary_points", []),
+        }
+
+    def _sales_pipeline_metrics(self, payload: dict[str, Any], _: dict[str, Any]) -> dict[str, Any]:
+        combined = self.legacy_tool_center._sales_analytics(payload)
+        return {key: combined[key] for key in ["focus_metric", "period", "region", "lead_count", "qualified_leads", "deals", "conversion_rate", "avg_cycle_days"]}
+
+    def _sales_risk_lookup(self, payload: dict[str, Any], _: dict[str, Any]) -> dict[str, Any]:
+        combined = self.legacy_tool_center._sales_analytics(payload)
+        return {"risk_customers": combined.get("risk_customers", [])}
+
+    def _marketing_brief(self, payload: dict[str, Any], _: dict[str, Any]) -> dict[str, Any]:
+        combined = self.legacy_tool_center._marketing_brief(payload)
+        return {key: combined[key] for key in ["product_name", "audience", "channels", "key_benefits", "tone"]}
+
+    def _marketing_compliance(self, payload: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
+        channels = observation.get("channels", payload.get("channels", ["xiaohongshu"]))
+        return {
+            "compliance_risks": [
+                "避免使用绝对化效果承诺",
+                "发布前复核产品能力表述",
+            ],
+            "channel_notes": {channel: f"为 {channel} 准备一个主卖点和一个行动号召" for channel in channels},
+        }
+
+    def _support_source_loader(self, payload: dict[str, Any], _: dict[str, Any]) -> dict[str, Any]:
+        tickets = payload.get("tickets", [])
+        data_source = payload.get("data_source")
+        source_summary: dict[str, Any] = {}
+        if isinstance(data_source, dict) and data_source.get("provider"):
+            try:
+                batch = self.external_data.load_support_tickets(data_source)
+                tickets = batch.records
+                source_summary = {"provider": batch.provider, **batch.summary}
+            except ExternalDataError as exc:
+                source_summary = {
+                    "provider": str(data_source.get("provider", "")),
+                    "error": str(exc),
+                    "fallback_to_sample": True,
+                }
+        return {"tickets": tickets, "data_source_summary": source_summary}
+
+    def _support_classifier(self, payload: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
+        tickets = observation.get("tickets") or payload.get("tickets", [])
+        temp_payload = dict(payload)
+        temp_payload["tickets"] = tickets
+        combined, _ = self.legacy_tool_center._support_triage(temp_payload)
+        merged = {
+            "tickets": combined.get("tickets", []),
+            "high_priority_count": combined.get("high_priority_count", 0),
+            "requires_incident_handoff": combined.get("requires_incident_handoff", False),
+        }
+        if observation.get("data_source_summary"):
+            merged["data_source_summary"] = observation["data_source_summary"]
+        elif combined.get("data_source_summary"):
+            merged["data_source_summary"] = combined["data_source_summary"]
+        return merged
+
+    def _meeting_action_items(self, payload: dict[str, Any], _: dict[str, Any]) -> dict[str, Any]:
+        combined = self.legacy_tool_center._meeting_extract(payload)
+        return {
+            "meeting_title": combined.get("meeting_title", payload.get("meeting_title", "会议")),
+            "action_items": combined.get("action_items", []),
+            "owner_count": combined.get("owner_count", 0),
+        }
+
+    def _meeting_summary_points(self, payload: dict[str, Any], _: dict[str, Any]) -> dict[str, Any]:
+        combined = self.legacy_tool_center._meeting_extract(payload)
+        return {
+            "meeting_title": combined.get("meeting_title", payload.get("meeting_title", "会议")),
+            "summary_points": combined.get("summary_points", []),
+        }
+
+
+class OperatorAgent:
+    def __init__(self, llm_service: LLMService, toolbox: OperatorToolbox, memory_service: AgentMemoryService) -> None:
+        self.llm_service = llm_service
+        self.toolbox = toolbox
+        self.memory_service = memory_service
+
+    def execute(
+        self,
+        *,
+        request: WorkflowRequest,
+        execution_profile: ExecutionProfile,
+        prompt_profile: PromptProfile,
+        planning_context: dict[str, Any] | None = None,
+        max_iterations: int = 3,
+    ) -> OperatorExecutionResult:
+        observation: dict[str, Any] = {}
+        events: list[dict[str, Any]] = []
+        available_tools = self.toolbox.available_tools(request.workflow_type)
+        remaining_tools = [tool.name for tool in available_tools]
+        operator_memory = self.memory_service.operator_memory(request)
+
+        for iteration in range(max_iterations):
+            fallback_decision = self._fallback_decision(request, remaining_tools, observation)
+            decision_prompt = self._decision_prompt(
+                request=request,
+                planning_context=planning_context or {},
+                prompt_profile=prompt_profile,
+                operator_memory=operator_memory,
+                observation=observation,
+                available_tools=available_tools,
+                remaining_tools=remaining_tools,
+            )
+            response = self.llm_service.generate_json(
+                route_target="operator",
+                system_prompt=(
+                    "你是企业 AI 工作流中的 OperatorAgent。"
+                    "请根据任务目标、规划上下文、历史工具经验和当前观察结果，"
+                    "判断下一步应该调用哪个工具，或在信息足够时结束工具调用。"
+                    "必须返回 JSON，键为 action、selected_tool、tool_input、reason。"
+                ),
+                user_prompt=decision_prompt,
+                fallback=fallback_decision.model_dump(mode="json"),
+                execution_profile=execution_profile,
+                response_model=OperatorDecision,
+            )
+            decision = OperatorDecision(**response.payload)
+
+            if decision.action == "finish" and observation and self._is_observation_sufficient(request.workflow_type, observation):
+                events.append(
+                    {
+                        "message": "模型判断当前信息已足够，结束工具调用。",
+                        "tool_call": None,
+                        "llm_call": response.call,
+                    }
+                )
+                break
+
+            selected_tool = decision.selected_tool or (remaining_tools[0] if remaining_tools else None)
+            if not selected_tool:
+                break
+
+            tool_payload = dict(request.input_payload)
+            tool_payload.update(decision.tool_input)
+            partial, tool_call = self.toolbox.execute(selected_tool, tool_payload, observation)
+            observation.update(partial)
+            events.append(
+                {
+                    "message": f"选择工具 {selected_tool}：{decision.reason}",
+                    "tool_call": tool_call,
+                    "llm_call": response.call,
+                }
+            )
+            if selected_tool in remaining_tools:
+                remaining_tools.remove(selected_tool)
+            if not remaining_tools:
+                break
+
+        if not observation:
+            for tool_name in self.toolbox.fallback_sequence(request.workflow_type, request.input_payload):
+                partial, tool_call = self.toolbox.execute(tool_name, request.input_payload, observation)
+                observation.update(partial)
+                events.append(
+                    {
+                        "message": f"回退执行工具 {tool_name}，确保流程具备基础输入。",
+                        "tool_call": tool_call,
+                        "llm_call": None,
+                    }
+                )
+
+        raw_result = self.toolbox.finalize(request.workflow_type, request.input_payload, observation)
+        operator_context = {
+            "memory": operator_memory,
+            "used_tools": [event["tool_call"].name for event in events if event.get("tool_call")],
+            "final_observation": observation,
+        }
+        return OperatorExecutionResult(raw_result=raw_result, operator_context=operator_context, events=events)
+
+    @staticmethod
+    def _fallback_decision(
+        request: WorkflowRequest,
+        remaining_tools: list[str],
+        observation: dict[str, Any],
+    ) -> OperatorDecision:
+        if observation and not remaining_tools:
+            return OperatorDecision(action="finish", reason="已收集到完成当前工作流所需的信息。")
+        return OperatorDecision(
+            action="use_tool",
+            selected_tool=remaining_tools[0] if remaining_tools else None,
+            reason="按工作流默认工具链执行，确保兼容当前流程。",
+        )
+
+    @staticmethod
+    def _decision_prompt(
+        *,
+        request: WorkflowRequest,
+        planning_context: dict[str, Any],
+        prompt_profile: PromptProfile,
+        operator_memory: dict[str, Any],
+        observation: dict[str, Any],
+        available_tools: list[AgentTool],
+        remaining_tools: list[str],
+    ) -> str:
+        tool_rows = [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "remaining": tool.name in remaining_tools,
+            }
+            for tool in available_tools
+        ]
+        return (
+            f"Prompt 方案：{prompt_profile.name} {prompt_profile.version}\n"
+            f"工作流类型：{request.workflow_type.value}\n"
+            f"任务输入 JSON：\n{json.dumps(request.input_payload, ensure_ascii=False)}\n"
+            f"规划上下文 JSON：\n{json.dumps(planning_context, ensure_ascii=False)}\n"
+            f"Operator 历史记忆 JSON：\n{json.dumps(operator_memory, ensure_ascii=False)}\n"
+            f"当前观察结果 JSON：\n{json.dumps(observation, ensure_ascii=False)}\n"
+            f"可用工具 JSON：\n{json.dumps(tool_rows, ensure_ascii=False)}\n"
+            "如果信息不足，请选择一个 remaining=true 的工具；如果信息已经足够进入下游分析，请返回 finish。"
+        )
+
+
+    @staticmethod
+    def _is_observation_sufficient(workflow_type: WorkflowType, observation: dict[str, Any]) -> bool:
+        required_keys = {
+            WorkflowType.SALES_FOLLOWUP: {"lead_count", "conversion_rate", "risk_customers"},
+            WorkflowType.MARKETING_CAMPAIGN: {"product_name", "channels", "compliance_risks"},
+            WorkflowType.SUPPORT_TRIAGE: {"tickets", "high_priority_count", "requires_incident_handoff"},
+            WorkflowType.MEETING_MINUTES: {"meeting_title", "action_items", "summary_points"},
+        }[workflow_type]
+        return required_keys.issubset(set(observation.keys()))
+
+
 class AnalystAgent:
     def __init__(self, llm_service: LLMService) -> None:
         self.llm_service = llm_service
@@ -469,6 +1080,7 @@ class AnalystAgent:
         *,
         request: WorkflowRequest,
         raw_result: dict[str, Any],
+        memory_context: dict[str, Any],
         execution_profile: ExecutionProfile,
         prompt_profile: PromptProfile,
     ) -> tuple[dict[str, Any], Any]:
@@ -479,7 +1091,8 @@ class AnalystAgent:
         user_prompt = (
             f"Prompt 方案要求：{prompt_profile.analyst_instruction}\n"
             f"工作流类型：{request.workflow_type.value}\n"
-            f"原始结果 JSON：\n{json.dumps(raw_result, ensure_ascii=False)}"
+            f"原始结果 JSON：\n{json.dumps(raw_result, ensure_ascii=False)}\n"
+            f"历史记忆 JSON：\n{json.dumps(memory_context, ensure_ascii=False)}"
         )
         response = self.llm_service.generate_json(
             route_target="analyst",
@@ -644,6 +1257,7 @@ class ReviewerAgent:
         raw_result: dict[str, Any],
         analysis: dict[str, Any],
         deliverables: dict[str, Any],
+        memory_context: dict[str, Any],
         execution_profile: ExecutionProfile,
         prompt_profile: PromptProfile,
     ) -> tuple[dict[str, Any], Any]:
@@ -656,7 +1270,8 @@ class ReviewerAgent:
             f"工作流类型：{request.workflow_type.value}\n"
             f"原始结果 JSON：\n{json.dumps(raw_result, ensure_ascii=False)}\n"
             f"分析结果 JSON：\n{json.dumps(analysis, ensure_ascii=False)}\n"
-            f"交付结果 JSON：\n{json.dumps(deliverables, ensure_ascii=False)}"
+            f"交付结果 JSON：\n{json.dumps(deliverables, ensure_ascii=False)}\n"
+            f"历史记忆 JSON：\n{json.dumps(memory_context, ensure_ascii=False)}"
         )
         response = self.llm_service.generate_json(
             route_target="reviewer",
@@ -835,12 +1450,14 @@ class WorkflowEngine:
         self.repository = repository
         self.settings = settings
         self.prompt_profiles = PromptProfileService(repository)
-        self.memory_service = AgentMemoryService(repository)
+        self.memory_service = AgentMemoryService(repository, settings)
         self.planning_context_tool = PlanningContextTool(self.memory_service)
         self.external_data = ExternalDataService(settings)
         self.tool_center = ToolCenter(self.external_data)
+        self.operator_toolbox = OperatorToolbox(self.external_data)
         self.llm_service = LLMService(settings)
         self.planner_agent = PlannerAgent(self.llm_service, self.planning_context_tool)
+        self.operator_agent = OperatorAgent(self.llm_service, self.operator_toolbox, self.memory_service)
         self.analyst_agent = AnalystAgent(self.llm_service)
         self.content_agent = ContentAgent(self.llm_service)
         self.reviewer_agent = ReviewerAgent(self.llm_service)
@@ -954,7 +1571,7 @@ class WorkflowEngine:
     def _build_graph(self):
         graph = StateGraph(WorkflowState)
         graph.add_node("planner", self._planner_step)
-        graph.add_node("operator", self._operator_step)
+        graph.add_node("operator", self._operator_step_v2)
         graph.add_node("analyst", self._analyst_step)
         graph.add_node("content", self._content_step)
         graph.add_node("reviewer", self._reviewer_step)
@@ -1003,18 +1620,53 @@ class WorkflowEngine:
         state["raw_result"] = raw_result
         return state
 
+    def _operator_step_v2(self, state: WorkflowState) -> WorkflowState:
+        run = state["run"]
+        request = state["request"]
+        run.touch(status=RunStatus.EXECUTING, current_step="operator")
+        operator_result = self.operator_agent.execute(
+            request=request,
+            execution_profile=state["execution_profile"],
+            prompt_profile=state["prompt_profile"],
+            planning_context=state.get("planning_context"),
+        )
+        for event in operator_result.events:
+            run.add_log(
+                "OperatorAgent",
+                event["message"],
+                tool_call=event.get("tool_call"),
+                llm_call=event.get("llm_call"),
+            )
+        state["operator_context"] = operator_result.operator_context
+        state["raw_result"] = operator_result.raw_result
+        return state
+
     def _analyst_step(self, state: WorkflowState) -> WorkflowState:
         run = state["run"]
         request = state["request"]
         run.touch(status=RunStatus.EXECUTING, current_step="analyst")
+        analyst_memory = self.memory_service.analyst_memory(
+            request,
+            prompt_profile=state["prompt_profile"],
+        )
+        analyst_context = {
+            "memory": analyst_memory,
+            "memory_hits": self.memory_service.memory_hits(analyst_memory),
+        }
         analysis, llm_call = self.analyst_agent.analyze(
             request=request,
             raw_result=state["raw_result"],
+            memory_context=analyst_context,
             execution_profile=state["execution_profile"],
             prompt_profile=state["prompt_profile"],
         )
-        run.add_log("AnalystAgent", "已完成结果分析与行动建议整理。", llm_call=llm_call)
+        run.add_log(
+            "AnalystAgent",
+            f"已完成结果分析与行动建议整理，并注入 {analyst_context['memory_hits']} 条历史记忆。",
+            llm_call=llm_call,
+        )
         state["analysis"] = analysis
+        state["analyst_context"] = analyst_context
         return state
 
     def _content_step(self, state: WorkflowState) -> WorkflowState:
@@ -1036,11 +1688,20 @@ class WorkflowEngine:
         run = state["run"]
         request = state["request"]
         run.touch(status=RunStatus.REVIEWING, current_step="reviewer")
+        reviewer_memory = self.memory_service.reviewer_memory(
+            request,
+            prompt_profile=state["prompt_profile"],
+        )
+        reviewer_context = {
+            "memory": reviewer_memory,
+            "memory_hits": self.memory_service.memory_hits(reviewer_memory),
+        }
         review_payload, llm_call = self.reviewer_agent.review(
             request=request,
             raw_result=state["raw_result"],
             analysis=state["analysis"],
             deliverables=state["deliverables"],
+            memory_context=reviewer_context,
             execution_profile=state["execution_profile"],
             prompt_profile=state["prompt_profile"],
         )
@@ -1049,14 +1710,22 @@ class WorkflowEngine:
         run.result = {
             "execution_profile": state["execution_profile"].model_dump(mode="json"),
             "planning_context": state.get("planning_context", {}),
+            "operator_context": state.get("operator_context", {}),
+            "analyst_context": state.get("analyst_context", {}),
+            "reviewer_context": reviewer_context,
             "raw_result": state["raw_result"],
             "analysis": state["analysis"],
             "deliverables": state["deliverables"],
             "review": review.model_dump(mode="json"),
             "metrics": summarize_run_metrics(run),
         }
-        run.add_log("ReviewerAgent", "已完成审核判断。", llm_call=llm_call)
+        run.add_log(
+            "ReviewerAgent",
+            f"已完成审核判断，并注入 {reviewer_context['memory_hits']} 条历史记忆。",
+            llm_call=llm_call,
+        )
         state["review"] = review_payload
+        state["reviewer_context"] = reviewer_context
         return state
 
     @staticmethod
@@ -1372,7 +2041,8 @@ class CostAnalyticsService:
             run for run in runs
             if run.created_at.year == now.year and run.created_at.month == now.month
         ]
-        month_calls = [call for run in monthly_runs for call in llm_calls_from_run(run)]
+        month_calls = [call for run in monthly_runs for call in real_llm_calls_from_run(run)]
+        fallback_requests = sum(fallback_request_count_from_run(run) for run in monthly_runs)
         total_cost = round(sum(call.estimated_cost_usd for call in month_calls), 6)
         total_tokens = sum(call.total_tokens for call in month_calls)
         total_latency_ms = sum(call.latency_ms for call in month_calls)
@@ -1440,6 +2110,7 @@ class CostAnalyticsService:
             "daily_cost_rows": [{"day": key, "cost_usd": round(value, 6)} for key, value in sorted(by_day.items())],
             "run_count": len(monthly_runs),
             "llm_call_count": len(month_calls),
+            "fallback_requests": fallback_requests,
             "alert_level": alert_level,
             "alert_title": alert_title,
             "alert_message": alert_message,
