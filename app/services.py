@@ -58,6 +58,9 @@ class WorkflowState(TypedDict, total=False):
     execution_profile: ExecutionProfile
     prompt_profile: PromptProfile
     planning_context: dict[str, Any]
+    analyst_context: dict[str, Any]
+    content_context: dict[str, Any]
+    reviewer_context: dict[str, Any]
     raw_result: dict[str, Any]
     analysis: dict[str, Any]
     deliverables: dict[str, Any]
@@ -88,18 +91,85 @@ class EvaluationDatasetRuntime:
 
 
 class AgentMemoryService:
-    def __init__(self, repository: WorkflowRepository) -> None:
+    def __init__(self, repository: WorkflowRepository, settings: Settings) -> None:
         self.repository = repository
+        self.settings = settings
+
+    def _related_runs(self, workflow_type: WorkflowType, limit: int) -> list[WorkflowRun]:
+        return [
+            run for run in self.repository.list_all()
+            if run.workflow_type == workflow_type and run.result
+        ][:limit]
+
+    def _related_feedback(self, workflow_type: WorkflowType, limit: int) -> list[FeedbackSample]:
+        return [
+            sample for sample in self.repository.list_feedback_samples()
+            if sample.workflow_type == workflow_type
+        ][:limit]
+
+    @staticmethod
+    def _execution_profile_id(payload: dict[str, Any]) -> str | None:
+        execution_profile = payload.get("execution_profile", {})
+        if not isinstance(execution_profile, dict):
+            return None
+        prompt_profile = execution_profile.get("prompt_profile", {})
+        if not isinstance(prompt_profile, dict):
+            return None
+        profile_id = prompt_profile.get("profile_id")
+        return str(profile_id) if profile_id else None
+
+    def _matching_runs(
+        self,
+        workflow_type: WorkflowType,
+        *,
+        prompt_profile_id: str,
+        limit: int,
+    ) -> list[WorkflowRun]:
+        preferred: list[WorkflowRun] = []
+        fallback: list[WorkflowRun] = []
+        for run in self.repository.list_all():
+            if run.workflow_type != workflow_type or not run.result:
+                continue
+            result = run.result if isinstance(run.result, dict) else {}
+            if self._execution_profile_id(result) == prompt_profile_id:
+                preferred.append(run)
+            else:
+                fallback.append(run)
+        return (preferred + fallback)[:limit]
+
+    def _matching_feedback(
+        self,
+        workflow_type: WorkflowType,
+        *,
+        prompt_profile_id: str,
+        limit: int,
+    ) -> list[FeedbackSample]:
+        preferred: list[FeedbackSample] = []
+        fallback: list[FeedbackSample] = []
+        for sample in self.repository.list_feedback_samples():
+            if sample.workflow_type != workflow_type:
+                continue
+            if self._execution_profile_id(sample.output_snapshot) == prompt_profile_id:
+                preferred.append(sample)
+            else:
+                fallback.append(sample)
+        return (preferred + fallback)[:limit]
+
+    @staticmethod
+    def memory_hits(memory: dict[str, Any]) -> int:
+        return len(memory.get("recent_runs", [])) + len(memory.get("feedback_samples", []))
 
     def planner_memory(self, request: WorkflowRequest, *, run_limit: int = 3, feedback_limit: int = 3) -> dict[str, Any]:
-        related_runs = [
-            run for run in self.repository.list_all()
-            if run.workflow_type == request.workflow_type and run.result
-        ][:run_limit]
-        related_feedback = [
-            sample for sample in self.repository.list_feedback_samples()
-            if sample.workflow_type == request.workflow_type
-        ][:feedback_limit]
+        if not self.settings.enable_runtime_memory:
+            return {
+                "enabled": False,
+                "recent_runs": [],
+                "feedback_samples": [],
+                "dominant_keywords": [],
+                "common_review_reasons": [],
+            }
+        related_runs = self._related_runs(request.workflow_type, run_limit)
+        related_feedback = self._related_feedback(request.workflow_type, feedback_limit)
 
         keyword_counter: Counter[str] = Counter()
         review_reason_counter: Counter[str] = Counter()
@@ -136,10 +206,203 @@ class AgentMemoryService:
             )
 
         return {
+            "enabled": True,
             "recent_runs": run_rows,
             "feedback_samples": feedback_rows,
             "dominant_keywords": [item for item, _ in keyword_counter.most_common(6)],
             "common_review_reasons": [item for item, _ in review_reason_counter.most_common(4)],
+        }
+
+    def analyst_memory(
+        self,
+        request: WorkflowRequest,
+        *,
+        prompt_profile: PromptProfile,
+        run_limit: int = 3,
+        feedback_limit: int = 2,
+    ) -> dict[str, Any]:
+        if not self.settings.enable_runtime_memory:
+            return {
+                "enabled": False,
+                "recent_runs": [],
+                "feedback_samples": [],
+                "prompt_profile_id": prompt_profile.profile_id,
+                "highlight_keywords": [],
+            }
+        related_runs = self._matching_runs(
+            request.workflow_type,
+            prompt_profile_id=prompt_profile.profile_id,
+            limit=run_limit,
+        )
+        related_feedback = self._matching_feedback(
+            request.workflow_type,
+            prompt_profile_id=prompt_profile.profile_id,
+            limit=feedback_limit,
+        )
+        keyword_counter: Counter[str] = Counter()
+        run_rows = []
+        for run in related_runs:
+            result = run.result if isinstance(run.result, dict) else {}
+            analysis = result.get("analysis", {}) if isinstance(result.get("analysis", {}), dict) else {}
+            review = result.get("review", {}) if isinstance(result.get("review", {}), dict) else {}
+            run_rows.append(
+                {
+                    "run_id": run.id,
+                    "status": run.status.value,
+                    "summary": analysis.get("summary", ""),
+                    "insights": [str(item) for item in analysis.get("insights", [])[:3]],
+                    "review_reasons": [str(item) for item in review.get("reasons", [])[:2]],
+                    "prompt_profile_id": self._execution_profile_id(result),
+                    "updated_at": run.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        feedback_rows = []
+        for sample in related_feedback:
+            keywords = [str(item).strip() for item in sample.expected_keywords if str(item).strip()]
+            keyword_counter.update(keywords)
+            feedback_rows.append(
+                {
+                    "sample_id": sample.id,
+                    "comment": sample.reviewer_comment,
+                    "keywords": keywords[:5],
+                    "expected_status": sample.expected_status.value,
+                    "prompt_profile_id": self._execution_profile_id(sample.output_snapshot),
+                }
+            )
+        return {
+            "enabled": True,
+            "prompt_profile_id": prompt_profile.profile_id,
+            "recent_runs": run_rows,
+            "feedback_samples": feedback_rows,
+            "highlight_keywords": [item for item, _ in keyword_counter.most_common(5)],
+        }
+
+    def content_memory(
+        self,
+        request: WorkflowRequest,
+        *,
+        prompt_profile: PromptProfile,
+        run_limit: int = 3,
+        feedback_limit: int = 2,
+    ) -> dict[str, Any]:
+        if not self.settings.enable_runtime_memory:
+            return {
+                "enabled": False,
+                "recent_runs": [],
+                "feedback_samples": [],
+                "prompt_profile_id": prompt_profile.profile_id,
+                "common_output_keys": [],
+            }
+        related_runs = self._matching_runs(
+            request.workflow_type,
+            prompt_profile_id=prompt_profile.profile_id,
+            limit=run_limit,
+        )
+        related_feedback = self._matching_feedback(
+            request.workflow_type,
+            prompt_profile_id=prompt_profile.profile_id,
+            limit=feedback_limit,
+        )
+        output_key_counter: Counter[str] = Counter()
+        run_rows = []
+        for run in related_runs:
+            result = run.result if isinstance(run.result, dict) else {}
+            deliverables = result.get("deliverables", {}) if isinstance(result.get("deliverables", {}), dict) else {}
+            review = result.get("review", {}) if isinstance(result.get("review", {}), dict) else {}
+            output_keys = [str(key) for key in deliverables.keys()]
+            output_key_counter.update(output_keys)
+            run_rows.append(
+                {
+                    "run_id": run.id,
+                    "status": run.status.value,
+                    "deliverable_keys": output_keys[:6],
+                    "review_reasons": [str(item) for item in review.get("reasons", [])[:2]],
+                    "prompt_profile_id": self._execution_profile_id(result),
+                    "updated_at": run.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        feedback_rows = []
+        for sample in related_feedback:
+            feedback_rows.append(
+                {
+                    "sample_id": sample.id,
+                    "comment": sample.reviewer_comment,
+                    "keywords": [str(item) for item in sample.expected_keywords[:5]],
+                    "expected_status": sample.expected_status.value,
+                    "prompt_profile_id": self._execution_profile_id(sample.output_snapshot),
+                }
+            )
+        return {
+            "enabled": True,
+            "prompt_profile_id": prompt_profile.profile_id,
+            "recent_runs": run_rows,
+            "feedback_samples": feedback_rows,
+            "common_output_keys": [item for item, _ in output_key_counter.most_common(6)],
+        }
+
+    def reviewer_memory(
+        self,
+        request: WorkflowRequest,
+        *,
+        prompt_profile: PromptProfile,
+        run_limit: int = 3,
+        feedback_limit: int = 3,
+    ) -> dict[str, Any]:
+        if not self.settings.enable_runtime_memory:
+            return {
+                "enabled": False,
+                "recent_runs": [],
+                "feedback_samples": [],
+                "prompt_profile_id": prompt_profile.profile_id,
+                "common_expected_statuses": [],
+            }
+        related_runs = self._matching_runs(
+            request.workflow_type,
+            prompt_profile_id=prompt_profile.profile_id,
+            limit=run_limit,
+        )
+        related_feedback = self._matching_feedback(
+            request.workflow_type,
+            prompt_profile_id=prompt_profile.profile_id,
+            limit=feedback_limit,
+        )
+        status_counter: Counter[str] = Counter()
+        run_rows = []
+        for run in related_runs:
+            result = run.result if isinstance(run.result, dict) else {}
+            review = result.get("review", {}) if isinstance(result.get("review", {}), dict) else {}
+            status = str(review.get("status", run.status.value))
+            status_counter.update([status])
+            run_rows.append(
+                {
+                    "run_id": run.id,
+                    "status": run.status.value,
+                    "review_status": status,
+                    "review_score": review.get("score"),
+                    "review_reasons": [str(item) for item in review.get("reasons", [])[:3]],
+                    "prompt_profile_id": self._execution_profile_id(result),
+                    "updated_at": run.updated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        feedback_rows = []
+        for sample in related_feedback:
+            status_counter.update([sample.expected_status.value])
+            feedback_rows.append(
+                {
+                    "sample_id": sample.id,
+                    "comment": sample.reviewer_comment,
+                    "keywords": [str(item) for item in sample.expected_keywords[:5]],
+                    "expected_status": sample.expected_status.value,
+                    "review_score": sample.review_score,
+                    "prompt_profile_id": self._execution_profile_id(sample.output_snapshot),
+                }
+            )
+        return {
+            "enabled": True,
+            "prompt_profile_id": prompt_profile.profile_id,
+            "recent_runs": run_rows,
+            "feedback_samples": feedback_rows,
+            "common_expected_statuses": [item for item, _ in status_counter.most_common(4)],
         }
 
 
@@ -469,6 +732,7 @@ class AnalystAgent:
         *,
         request: WorkflowRequest,
         raw_result: dict[str, Any],
+        memory_context: dict[str, Any],
         execution_profile: ExecutionProfile,
         prompt_profile: PromptProfile,
     ) -> tuple[dict[str, Any], Any]:
@@ -479,7 +743,8 @@ class AnalystAgent:
         user_prompt = (
             f"Prompt 方案要求：{prompt_profile.analyst_instruction}\n"
             f"工作流类型：{request.workflow_type.value}\n"
-            f"原始结果 JSON：\n{json.dumps(raw_result, ensure_ascii=False)}"
+            f"原始结果 JSON：\n{json.dumps(raw_result, ensure_ascii=False)}\n"
+            f"历史记忆 JSON：\n{json.dumps(memory_context, ensure_ascii=False)}"
         )
         response = self.llm_service.generate_json(
             route_target="analyst",
@@ -559,6 +824,7 @@ class ContentAgent:
         request: WorkflowRequest,
         raw_result: dict[str, Any],
         analysis: dict[str, Any],
+        memory_context: dict[str, Any],
         execution_profile: ExecutionProfile,
         prompt_profile: PromptProfile,
     ) -> tuple[dict[str, Any], Any]:
@@ -572,6 +838,7 @@ class ContentAgent:
             f"原始结果 JSON：\n{json.dumps(raw_result, ensure_ascii=False)}\n"
             f"分析结果 JSON：\n{json.dumps(analysis, ensure_ascii=False)}"
         )
+        user_prompt += f"\n鍘嗗彶璁板繂 JSON锛歕n{json.dumps(memory_context, ensure_ascii=False)}"
         response = self.llm_service.generate_json(
             route_target="content",
             system_prompt=system_prompt,
@@ -644,6 +911,7 @@ class ReviewerAgent:
         raw_result: dict[str, Any],
         analysis: dict[str, Any],
         deliverables: dict[str, Any],
+        memory_context: dict[str, Any],
         execution_profile: ExecutionProfile,
         prompt_profile: PromptProfile,
     ) -> tuple[dict[str, Any], Any]:
@@ -656,7 +924,8 @@ class ReviewerAgent:
             f"工作流类型：{request.workflow_type.value}\n"
             f"原始结果 JSON：\n{json.dumps(raw_result, ensure_ascii=False)}\n"
             f"分析结果 JSON：\n{json.dumps(analysis, ensure_ascii=False)}\n"
-            f"交付结果 JSON：\n{json.dumps(deliverables, ensure_ascii=False)}"
+            f"交付结果 JSON：\n{json.dumps(deliverables, ensure_ascii=False)}\n"
+            f"历史记忆 JSON：\n{json.dumps(memory_context, ensure_ascii=False)}"
         )
         response = self.llm_service.generate_json(
             route_target="reviewer",
@@ -835,7 +1104,7 @@ class WorkflowEngine:
         self.repository = repository
         self.settings = settings
         self.prompt_profiles = PromptProfileService(repository)
-        self.memory_service = AgentMemoryService(repository)
+        self.memory_service = AgentMemoryService(repository, settings)
         self.planning_context_tool = PlanningContextTool(self.memory_service)
         self.external_data = ExternalDataService(settings)
         self.tool_center = ToolCenter(self.external_data)
@@ -1007,40 +1276,77 @@ class WorkflowEngine:
         run = state["run"]
         request = state["request"]
         run.touch(status=RunStatus.EXECUTING, current_step="analyst")
+        analyst_memory = self.memory_service.analyst_memory(
+            request,
+            prompt_profile=state["prompt_profile"],
+        )
+        analyst_context = {
+            "memory": analyst_memory,
+            "memory_hits": self.memory_service.memory_hits(analyst_memory),
+        }
         analysis, llm_call = self.analyst_agent.analyze(
             request=request,
             raw_result=state["raw_result"],
+            memory_context=analyst_context,
             execution_profile=state["execution_profile"],
             prompt_profile=state["prompt_profile"],
         )
-        run.add_log("AnalystAgent", "已完成结果分析与行动建议整理。", llm_call=llm_call)
+        run.add_log(
+            "AnalystAgent",
+            f"已完成结果分析与行动建议整理，并注入 {analyst_context['memory_hits']} 条历史记忆。",
+            llm_call=llm_call,
+        )
         state["analysis"] = analysis
+        state["analyst_context"] = analyst_context
         return state
 
     def _content_step(self, state: WorkflowState) -> WorkflowState:
         run = state["run"]
         request = state["request"]
         run.touch(status=RunStatus.EXECUTING, current_step="content")
+        content_memory = self.memory_service.content_memory(
+            request,
+            prompt_profile=state["prompt_profile"],
+        )
+        content_context = {
+            "memory": content_memory,
+            "memory_hits": self.memory_service.memory_hits(content_memory),
+        }
         deliverables, llm_call = self.content_agent.generate(
             request=request,
             raw_result=state["raw_result"],
             analysis=state["analysis"],
+            memory_context=content_context,
             execution_profile=state["execution_profile"],
             prompt_profile=state["prompt_profile"],
         )
         run.add_log("ContentAgent", "已补充可直接使用的业务输出。", llm_call=llm_call)
+        run.add_log(
+            "ContentAgent",
+            f"鍘嗗彶璁板繂宸叉敞鍏?{content_context['memory_hits']} 鏉★紝鐢ㄤ簬鐢熸垚涓氬姟杈撳嚭銆?",
+        )
         state["deliverables"] = deliverables
+        state["content_context"] = content_context
         return state
 
     def _reviewer_step(self, state: WorkflowState) -> WorkflowState:
         run = state["run"]
         request = state["request"]
         run.touch(status=RunStatus.REVIEWING, current_step="reviewer")
+        reviewer_memory = self.memory_service.reviewer_memory(
+            request,
+            prompt_profile=state["prompt_profile"],
+        )
+        reviewer_context = {
+            "memory": reviewer_memory,
+            "memory_hits": self.memory_service.memory_hits(reviewer_memory),
+        }
         review_payload, llm_call = self.reviewer_agent.review(
             request=request,
             raw_result=state["raw_result"],
             analysis=state["analysis"],
             deliverables=state["deliverables"],
+            memory_context=reviewer_context,
             execution_profile=state["execution_profile"],
             prompt_profile=state["prompt_profile"],
         )
@@ -1049,14 +1355,22 @@ class WorkflowEngine:
         run.result = {
             "execution_profile": state["execution_profile"].model_dump(mode="json"),
             "planning_context": state.get("planning_context", {}),
+            "analyst_context": state.get("analyst_context", {}),
+            "content_context": state.get("content_context", {}),
+            "reviewer_context": reviewer_context,
             "raw_result": state["raw_result"],
             "analysis": state["analysis"],
             "deliverables": state["deliverables"],
             "review": review.model_dump(mode="json"),
             "metrics": summarize_run_metrics(run),
         }
-        run.add_log("ReviewerAgent", "已完成审核判断。", llm_call=llm_call)
+        run.add_log(
+            "ReviewerAgent",
+            f"已完成审核判断，并注入 {reviewer_context['memory_hits']} 条历史记忆。",
+            llm_call=llm_call,
+        )
         state["review"] = review_payload
+        state["reviewer_context"] = reviewer_context
         return state
 
     @staticmethod

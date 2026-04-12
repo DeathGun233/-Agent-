@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
+from app.config import Settings
 from app.db import UserAccountRecord
 from app.main import app, database
 from app.services import ReviewerAgent
@@ -359,3 +360,50 @@ def test_feedback_review_creates_feedback_sample() -> None:
     feedback_samples = client.get("/api/feedback-samples")
     assert feedback_samples.status_code == 200
     assert len(feedback_samples.json()) >= 1
+
+
+def test_runtime_memory_context_is_recorded_for_analyst_and_reviewer() -> None:
+    first = create_support_run()
+    login_as("reviewer", "reviewer123")
+    reviewed = client.post(
+        f"/api/workflows/{first['id']}/review",
+        json={"approve": True, "comment": "keep owner and risk notes"},
+    )
+    assert reviewed.status_code == 200
+
+    second = create_support_run()
+
+    analyst_context = second["result"]["analyst_context"]
+    reviewer_context = second["result"]["reviewer_context"]
+
+    assert analyst_context["memory_hits"] >= 1
+    assert reviewer_context["memory_hits"] >= 1
+    assert len(analyst_context["memory"]["recent_runs"]) >= 1
+    assert len(reviewer_context["memory"]["feedback_samples"]) >= 1
+    assert any("历史记忆" in log["message"] for log in second["logs"] if log["agent"] == "AnalystAgent")
+    assert any("历史记忆" in log["message"] for log in second["logs"] if log["agent"] == "ReviewerAgent")
+
+
+def test_runtime_memory_context_is_recorded_for_content_agent() -> None:
+    first = create_support_run()
+    login_as("reviewer", "reviewer123")
+    reviewed = client.post(
+        f"/api/workflows/{first['id']}/review",
+        json={"approve": True, "comment": "keep owner and risk notes"},
+    )
+    assert reviewed.status_code == 200
+
+    second = create_support_run()
+
+    content_context = second["result"]["content_context"]
+
+    assert content_context["memory_hits"] >= 1
+    assert len(content_context["memory"]["recent_runs"]) >= 1
+    assert len(content_context["memory"]["feedback_samples"]) >= 1
+    assert any("鍘嗗彶璁板繂" in log["message"] for log in second["logs"] if log["agent"] == "ContentAgent")
+
+
+def test_settings_can_disable_runtime_memory(monkeypatch) -> None:
+    monkeypatch.setenv("FLOWPILOT_ENABLE_RUNTIME_MEMORY", "false")
+    settings = Settings.from_env()
+    assert settings.enable_runtime_memory is False
