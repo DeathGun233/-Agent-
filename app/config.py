@@ -6,6 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "FlowPilot"
@@ -16,6 +23,7 @@ class Settings:
     api_key: str | None = None
     github_token: str | None = None
     disable_llm: bool = False
+    enable_runtime_memory: bool = True
     monthly_budget_usd: float = 25.0
     http_timeout_seconds: float = 12.0
     secret_key: str = "flowpilot-demo-secret"
@@ -29,19 +37,18 @@ class Settings:
             or os.getenv("OPENAI_API_KEY")
             or os.getenv("OPEN_AI_KEY")
         )
-        disable_llm = (
-            bool(os.getenv("FLOWPILOT_DISABLE_LLM"))
-            or bool(os.getenv("PYTEST_CURRENT_TEST"))
-            or ("pytest" in sys.modules)
-        )
+        pytest_mode = bool(os.getenv("PYTEST_CURRENT_TEST")) or ("pytest" in sys.modules)
+        disable_llm = env_flag("FLOWPILOT_DISABLE_LLM") or pytest_mode
+        default_database_url = "sqlite:///flowpilot_test.db" if pytest_mode else "sqlite:///flowpilot.db"
         return cls(
-            database_url=os.getenv("DATABASE_URL", "sqlite:///flowpilot.db"),
+            database_url=os.getenv("DATABASE_URL", default_database_url),
             redis_url=os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
             model_name=os.getenv("MODEL_NAME", "qwen3-max"),
             model_base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
             api_key=api_key,
             github_token=os.getenv("GITHUB_TOKEN"),
             disable_llm=disable_llm,
+            enable_runtime_memory=env_flag("FLOWPILOT_ENABLE_RUNTIME_MEMORY", default=True),
             monthly_budget_usd=float(os.getenv("FLOWPILOT_MONTHLY_BUDGET_USD", "25")),
             http_timeout_seconds=float(os.getenv("FLOWPILOT_HTTP_TIMEOUT_SECONDS", "12")),
             secret_key=os.getenv("FLOWPILOT_SECRET_KEY", "flowpilot-demo-secret"),
