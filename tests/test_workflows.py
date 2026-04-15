@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.db import UserAccountRecord
 from app.main import app, database
-from app.services import ReviewerAgent
+from app.services import ReviewerAgent, RouterAgent
 
 
 client = TestClient(app)
@@ -130,8 +130,10 @@ def test_graph_endpoint_exposes_langgraph_shape() -> None:
     body = response.json()
     assert response.status_code == 200
     assert body["runtime"] == "langgraph"
-    assert "planner" in body["nodes"]
-    assert any(edge["from"] == "reviewer" for edge in body["edges"])
+    assert "router" in body["nodes"]
+    assert any(edge["from"] == "planner" and edge["to"] == "router" for edge in body["edges"])
+    assert any(edge["from"] == "router" and edge["to"] == "planner" for edge in body["edges"])
+    assert any(edge["from"] == "router" and edge["to"] == "reviewer" for edge in body["edges"])
 
 
 def test_review_page_requires_reviewer_role() -> None:
@@ -158,6 +160,26 @@ def test_sales_workflow_runs_with_selected_model_prompt_and_routing() -> None:
     llm_logs = [log for log in body["logs"] if log.get("llm_call")]
     assert len(llm_logs) == 4
     assert {log["llm_call"]["route_target"] for log in llm_logs} == {"planner", "analyst", "content", "reviewer"}
+
+
+def test_router_requests_one_replan_when_content_is_missing() -> None:
+    decision = RouterAgent().decide(
+        last_node="content",
+        state={"deliverables": {}, "replan_count": 0},
+    )
+
+    assert decision["next_node"] == "planner"
+    assert decision["replan_count"] == 1
+
+
+def test_workflow_result_records_route_decisions() -> None:
+    body = create_sales_run()
+
+    route_decisions = body["result"]["route_decisions"]
+
+    assert route_decisions[0]["from_node"] == "planner"
+    assert route_decisions[0]["next_node"] == "operator"
+    assert any(item["next_node"] == "reviewer" for item in route_decisions)
 
 
 def test_waiting_human_reasons_do_not_include_auto_execute_copy() -> None:

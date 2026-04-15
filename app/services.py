@@ -57,6 +57,10 @@ class WorkflowState(TypedDict, total=False):
     request: WorkflowRequest
     execution_profile: ExecutionProfile
     prompt_profile: PromptProfile
+    last_node: str
+    next_node: str
+    replan_count: int
+    route_decisions: list[dict[str, Any]]
     planning_context: dict[str, Any]
     analyst_context: dict[str, Any]
     content_context: dict[str, Any]
@@ -1031,6 +1035,56 @@ class ReviewerAgent:
         }
 
 
+class RouterAgent:
+    def decide(self, *, last_node: str, state: dict[str, Any]) -> dict[str, Any]:
+        replan_count = int(state.get("replan_count", 0) or 0)
+        next_node = "complete_run"
+        reason = "workflow state is complete"
+
+        if last_node == "planner":
+            next_node = "operator"
+            reason = "plan is ready; collect or transform source data"
+        elif last_node == "operator":
+            next_node = "analyst"
+            reason = "raw tool result is available for analysis"
+        elif last_node == "analyst":
+            next_node = "content"
+            reason = "analysis is available for deliverable generation"
+        elif last_node == "content":
+            deliverables = state.get("deliverables", {})
+            if self._missing_deliverables(deliverables) and replan_count < 1:
+                next_node = "planner"
+                replan_count += 1
+                reason = "deliverables are missing; request one replanning pass"
+            else:
+                next_node = "reviewer"
+                reason = "deliverables are ready for review"
+        elif last_node == "reviewer":
+            review = state.get("review", {})
+            if isinstance(review, dict) and review.get("status") == "waiting_human":
+                next_node = "handoff_run"
+                reason = "review requires human handoff"
+            else:
+                next_node = "complete_run"
+                reason = "review approved automatic completion"
+
+        return {
+            "from_node": last_node,
+            "next_node": next_node,
+            "reason": reason,
+            "replan_count": replan_count,
+        }
+
+    @staticmethod
+    def _missing_deliverables(deliverables: Any) -> bool:
+        if not isinstance(deliverables, dict) or not deliverables:
+            return True
+        nested = deliverables.get("deliverables")
+        if isinstance(nested, dict):
+            return not bool(nested)
+        return False
+
+
 class FeedbackService:
     def __init__(self, repository: WorkflowRepository) -> None:
         self.repository = repository
@@ -1113,6 +1167,7 @@ class WorkflowEngine:
         self.analyst_agent = AnalystAgent(self.llm_service)
         self.content_agent = ContentAgent(self.llm_service)
         self.reviewer_agent = ReviewerAgent(self.llm_service)
+        self.router_agent = RouterAgent()
         self.feedback_service = FeedbackService(repository)
         self.graph = self._build_graph()
 
@@ -1166,6 +1221,8 @@ class WorkflowEngine:
             "request": request,
             "execution_profile": execution_profile,
             "prompt_profile": prompt_profile,
+            "replan_count": 0,
+            "route_decisions": [],
             "persist": persist,
         }
         try:
@@ -1208,15 +1265,21 @@ class WorkflowEngine:
     def graph_shape() -> dict[str, Any]:
         return {
             "runtime": "langgraph",
-            "nodes": ["planner", "operator", "analyst", "content", "reviewer", "complete_run", "handoff_run"],
+            "nodes": ["planner", "operator", "analyst", "content", "reviewer", "router", "complete_run", "handoff_run"],
             "edges": [
                 {"from": "start", "to": "planner"},
-                {"from": "planner", "to": "operator"},
-                {"from": "operator", "to": "analyst"},
-                {"from": "analyst", "to": "content"},
-                {"from": "content", "to": "reviewer"},
-                {"from": "reviewer", "to": "complete_run"},
-                {"from": "reviewer", "to": "handoff_run"},
+                {"from": "planner", "to": "router"},
+                {"from": "operator", "to": "router"},
+                {"from": "analyst", "to": "router"},
+                {"from": "content", "to": "router"},
+                {"from": "reviewer", "to": "router"},
+                {"from": "router", "to": "operator"},
+                {"from": "router", "to": "analyst"},
+                {"from": "router", "to": "content"},
+                {"from": "router", "to": "planner"},
+                {"from": "router", "to": "reviewer"},
+                {"from": "router", "to": "complete_run"},
+                {"from": "router", "to": "handoff_run"},
             ],
         }
 
@@ -1227,17 +1290,27 @@ class WorkflowEngine:
         graph.add_node("analyst", self._analyst_step)
         graph.add_node("content", self._content_step)
         graph.add_node("reviewer", self._reviewer_step)
+        graph.add_node("router", self._router_step)
         graph.add_node("complete_run", self._complete_step)
         graph.add_node("handoff_run", self._handoff_step)
         graph.add_edge(START, "planner")
-        graph.add_edge("planner", "operator")
-        graph.add_edge("operator", "analyst")
-        graph.add_edge("analyst", "content")
-        graph.add_edge("content", "reviewer")
+        graph.add_edge("planner", "router")
+        graph.add_edge("operator", "router")
+        graph.add_edge("analyst", "router")
+        graph.add_edge("content", "router")
+        graph.add_edge("reviewer", "router")
         graph.add_conditional_edges(
-            "reviewer",
-            self._route_after_review,
-            {"complete_run": "complete_run", "handoff_run": "handoff_run"},
+            "router",
+            self._route_from_router,
+            {
+                "planner": "planner",
+                "operator": "operator",
+                "analyst": "analyst",
+                "content": "content",
+                "reviewer": "reviewer",
+                "complete_run": "complete_run",
+                "handoff_run": "handoff_run",
+            },
         )
         graph.add_edge("complete_run", END)
         graph.add_edge("handoff_run", END)
@@ -1261,6 +1334,7 @@ class WorkflowEngine:
             tool_call=tool_call,
             llm_call=llm_call,
         )
+        state["last_node"] = "planner"
         return state
 
     def _operator_step(self, state: WorkflowState) -> WorkflowState:
@@ -1270,6 +1344,7 @@ class WorkflowEngine:
         raw_result, tool_call = self.tool_center.run(request.workflow_type, request.input_payload)
         run.add_log("OperatorAgent", f"已完成工具调用：{tool_call.name}。", tool_call=tool_call)
         state["raw_result"] = raw_result
+        state["last_node"] = "operator"
         return state
 
     def _analyst_step(self, state: WorkflowState) -> WorkflowState:
@@ -1298,6 +1373,7 @@ class WorkflowEngine:
         )
         state["analysis"] = analysis
         state["analyst_context"] = analyst_context
+        state["last_node"] = "analyst"
         return state
 
     def _content_step(self, state: WorkflowState) -> WorkflowState:
@@ -1327,6 +1403,7 @@ class WorkflowEngine:
         )
         state["deliverables"] = deliverables
         state["content_context"] = content_context
+        state["last_node"] = "content"
         return state
 
     def _reviewer_step(self, state: WorkflowState) -> WorkflowState:
@@ -1358,6 +1435,7 @@ class WorkflowEngine:
             "analyst_context": state.get("analyst_context", {}),
             "content_context": state.get("content_context", {}),
             "reviewer_context": reviewer_context,
+            "route_decisions": state.get("route_decisions", []),
             "raw_result": state["raw_result"],
             "analysis": state["analysis"],
             "deliverables": state["deliverables"],
@@ -1371,14 +1449,27 @@ class WorkflowEngine:
         )
         state["review"] = review_payload
         state["reviewer_context"] = reviewer_context
+        state["last_node"] = "reviewer"
+        return state
+
+    def _router_step(self, state: WorkflowState) -> WorkflowState:
+        run = state["run"]
+        last_node = state.get("last_node", "planner")
+        decision = self.router_agent.decide(last_node=last_node, state=dict(state))
+        state["next_node"] = str(decision["next_node"])
+        state["replan_count"] = int(decision["replan_count"])
+        route_decisions = list(state.get("route_decisions", []))
+        route_decisions.append(decision)
+        state["route_decisions"] = route_decisions
+        run.add_log(
+            "RouterAgent",
+            f"从 {decision['from_node']} 路由到 {decision['next_node']}：{decision['reason']}",
+        )
         return state
 
     @staticmethod
-    def _route_after_review(state: WorkflowState) -> str:
-        review = state.get("review") or {}
-        if review.get("status") == "waiting_human":
-            return "handoff_run"
-        return "complete_run"
+    def _route_from_router(state: WorkflowState) -> str:
+        return state.get("next_node", "complete_run")
 
     def _complete_step(self, state: WorkflowState) -> WorkflowState:
         run = state["run"]
@@ -1387,6 +1478,7 @@ class WorkflowEngine:
             run.review.status = RunStatus.COMPLETED
             run.review.needs_human_review = False
         run.add_log("System", "工作流已自动完成。")
+        run.result["route_decisions"] = state.get("route_decisions", [])
         run.result["metrics"] = summarize_run_metrics(run)
         return state
 
@@ -1397,6 +1489,7 @@ class WorkflowEngine:
             run.review.status = RunStatus.WAITING_HUMAN
             run.review.needs_human_review = True
         run.add_log("System", "工作流已进入人工审核。")
+        run.result["route_decisions"] = state.get("route_decisions", [])
         run.result["metrics"] = summarize_run_metrics(run)
         return state
 
