@@ -204,7 +204,12 @@ def test_router_uses_confident_model_route_when_allowed() -> None:
 
     decision = router.decide(
         last_node="content",
-        state={"deliverables": {"deliverables": {"summary": "ready"}}, "execution_profile": object()},
+        state={
+            "raw_result": {"items": [1]},
+            "analysis": {"summary": "ready"},
+            "deliverables": {"deliverables": {"summary": "ready"}},
+            "execution_profile": object(),
+        },
     )
 
     assert decision["next_node"] == "reviewer"
@@ -236,6 +241,27 @@ def test_router_falls_back_when_model_route_is_not_allowed() -> None:
     assert decision["final_route"] == "operator"
     assert decision["used_fallback"] is True
     assert decision["fallback_reason"] == "route_not_allowed"
+
+
+def test_router_falls_back_when_model_route_skips_required_state() -> None:
+    router = RouterAgent(
+        llm_service=FakeRouterLLM(
+            {
+                "route": "content",
+                "reason": "skip directly to content",
+                "confidence": 0.95,
+                "fallback_required": False,
+            }
+        )
+    )
+
+    decision = router.decide(last_node="planner", state={"execution_profile": object()})
+
+    assert decision["next_node"] == "operator"
+    assert decision["decision_source"] == "rule"
+    assert decision["model_route"] == "content"
+    assert decision["used_fallback"] is True
+    assert decision["fallback_reason"] == "route_not_ready"
 
 
 def test_router_falls_back_when_model_confidence_is_low() -> None:
