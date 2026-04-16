@@ -722,6 +722,58 @@ def test_run_detail_page_shows_route_trace_audit_fields_when_present() -> None:
     assert "route_not_ready" in detail.text
 
 
+def test_run_detail_page_shows_operator_context_when_present() -> None:
+    run = WorkflowRun(
+        workflow_type=WorkflowType.SALES_FOLLOWUP,
+        status=RunStatus.COMPLETED,
+        current_step="completed",
+        objective="Operator context fixture",
+        result={
+            "operator_context": {
+                "decision_source": "model",
+                "selected_tool": "sales_analytics_tool",
+                "executed_tool": "sales_analytics_tool",
+                "used_fallback": False,
+                "fallback_reason": None,
+                "tool_choices": ["sales_analytics_tool"],
+                "decision_reason": "need funnel metrics first",
+                "confidence": 0.93,
+            }
+        },
+    )
+    repository.save(run)
+    login_as("viewer", "viewer123")
+
+    detail = client.get(f"/runs/{run.id}")
+
+    assert detail.status_code == 200
+    assert "Operator Decision" in detail.text
+    assert "MODEL" in detail.text
+    assert "Selected Tool" in detail.text
+    assert "Executed Tool" in detail.text
+    assert "sales_analytics_tool" in detail.text
+    assert "need funnel metrics first" in detail.text
+    assert "0.93" in detail.text
+
+
+def test_run_detail_page_handles_missing_operator_context() -> None:
+    run = WorkflowRun(
+        workflow_type=WorkflowType.SALES_FOLLOWUP,
+        status=RunStatus.COMPLETED,
+        current_step="completed",
+        objective="Legacy run without operator context",
+        result={"analysis": {"summary": "legacy result"}},
+    )
+    repository.save(run)
+    login_as("viewer", "viewer123")
+
+    detail = client.get(f"/runs/{run.id}")
+
+    assert detail.status_code == 200
+    assert "Operator Decision" in detail.text
+    assert "No operator context recorded (legacy run)." in detail.text
+
+
 def test_workflow_export_endpoint_supports_markdown_html_and_pdf() -> None:
     created = create_sales_run()
     markdown = client.get(f"/runs/{created['id']}/export?format=markdown")

@@ -419,4 +419,3 @@ Expected: no whitespace or patch-format errors
 git add app/services.py tests/test_workflows.py
 git commit -m "test: verify operator tool calling compatibility"
 ```
-

@@ -197,4 +197,3 @@ This phase is complete when:
 - `operator_context` is persisted and auditable
 - existing workflow behavior remains compatible
 - targeted tests and full test suite pass
-
