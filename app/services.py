@@ -601,6 +601,27 @@ class ToolCenter:
     def __init__(self, external_data: ExternalDataService) -> None:
         self.external_data = external_data
 
+    @staticmethod
+    def _provenance(
+        *,
+        data_status: str,
+        matched_rows: int,
+        source: str,
+        filters: dict[str, Any],
+        fallback_reason: str | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "data_status": data_status,
+            "matched_rows": matched_rows,
+            "source": source,
+            "filters": filters,
+            "fallback_reason": fallback_reason,
+        }
+        if message:
+            result["message"] = message
+        return result
+
     def run(self, workflow_type: WorkflowType, payload: dict[str, Any]) -> tuple[dict[str, Any], ToolCall]:
         return self.run_named(self.default_tool_for(workflow_type, payload), payload)
 
@@ -712,6 +733,16 @@ class ToolCenter:
                 "发布前复核产品能力表述",
             ],
             "channel_notes": {channel: f"为 {channel} 准备一个主卖点和一个行动号召" for channel in channels},
+            **ToolCenter._provenance(
+                data_status="matched",
+                matched_rows=len(channels),
+                source="request_payload",
+                filters={
+                    "product_name": payload.get("product_name", "目标产品"),
+                    "audience": payload.get("audience", "目标人群"),
+                    "channels": channels,
+                },
+            ),
         }
 
     def _support_triage(self, payload: dict[str, Any], *, use_external_source: bool = True) -> tuple[dict[str, Any], str]:
@@ -719,13 +750,19 @@ class ToolCenter:
         data_source = payload.get("data_source")
         tool_name = "support_triage_tool"
         source_summary: dict[str, Any] = {}
+        source = "request_payload"
+        fallback_reason = None
         if use_external_source and isinstance(data_source, dict) and data_source.get("provider"):
+            provider = str(data_source.get("provider", "")).strip()
+            source = provider or "external_source"
             try:
                 batch = self.external_data.load_support_tickets(data_source)
                 tickets = batch.records
                 tool_name = f"{batch.provider}_tool"
+                source = batch.provider
                 source_summary = {"provider": batch.provider, **batch.summary}
             except ExternalDataError as exc:
+                fallback_reason = str(exc)
                 source_summary = {
                     "provider": str(data_source.get("provider", "")),
                     "error": str(exc),
@@ -762,6 +799,28 @@ class ToolCenter:
             "high_priority_count": sum(1 for item in enriched if item["priority"] == "high"),
             "requires_incident_handoff": any(item["category"] == "incident" for item in enriched),
             "data_source_summary": source_summary,
+            **self._provenance(
+                data_status=(
+                    "fallback"
+                    if source_summary.get("fallback_to_sample")
+                    else "matched"
+                    if enriched
+                    else "no_match"
+                ),
+                matched_rows=len(enriched),
+                source=source,
+                filters={
+                    "provider": source_summary.get("provider") or source,
+                    "ticket_count": len(enriched),
+                },
+                fallback_reason=(
+                    fallback_reason
+                    if fallback_reason
+                    else None
+                    if enriched
+                    else "no_support_tickets_provided"
+                ),
+            ),
         }
         return result, tool_name
 
@@ -785,6 +844,14 @@ class ToolCenter:
             "action_items": actions,
             "owner_count": len({item["owner"] for item in actions}),
             "summary_points": sentences[:3],
+            **ToolCenter._provenance(
+                data_status="matched" if actions else "no_match",
+                matched_rows=len(actions),
+                source="request_payload",
+                filters={"meeting_title": payload.get("meeting_title", "浼氳")},
+                fallback_reason=None if actions else "no_meeting_action_items_extracted",
+                message=None if actions else "No meeting action items were extracted from the provided notes.",
+            ),
         }
 
 
@@ -1177,6 +1244,16 @@ class ReviewerAgent:
                 needs_human_review = True
                 reasons.append("当前未抽取到清晰的行动项，需要人工确认。")
                 score = 0.55
+
+        data_status = raw_result.get("data_status")
+        if data_status in {"no_match", "partial", "fallback", "error"}:
+            needs_human_review = True
+            score = min(score, 0.55)
+            source = raw_result.get("source") or "unknown"
+            fallback_reason = raw_result.get("fallback_reason") or "--"
+            reasons.append(
+                f"data_status={data_status} from {source} requires human review; fallback_reason={fallback_reason}."
+            )
 
         if not reasons:
             reasons.append("结果结构完整，可直接流转执行。")

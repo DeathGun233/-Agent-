@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.db import UserAccountRecord
-from app.external_data import ExternalDataService
+from app.external_data import ExternalDataError, ExternalDataService
 from app.main import app, database, repository
 from app.models import ReviewDecision, ReviewOutput, RunStatus, WorkflowRequest, WorkflowRun, WorkflowType
 from app.services import AnalystAgent, OperatorAgent, ReviewerAgent, RouterAgent, ToolCenter
@@ -479,6 +479,107 @@ def test_reviewer_requires_human_review_when_sales_data_is_missing() -> None:
     assert review["needs_human_review"] is True
     assert review["score"] <= 0.5
     assert any("未找到匹配销售数据" in reason for reason in review["reasons"])
+
+
+def test_non_sales_tools_return_standard_data_provenance_contracts() -> None:
+    tool_center = ToolCenter(ExternalDataService(Settings()))
+
+    marketing_result, marketing_call = tool_center.run(
+        WorkflowType.MARKETING_CAMPAIGN,
+        {
+            "product_name": "FlowPilot",
+            "audience": "ops teams",
+            "channels": ["email", "linkedin"],
+            "key_benefits": ["faster triage"],
+        },
+    )
+    support_result, support_call = tool_center.run(
+        WorkflowType.SUPPORT_TRIAGE,
+        {"tickets": [{"customer": "ACME", "message": "production outage"}]},
+    )
+    meeting_result, meeting_call = tool_center.run(
+        WorkflowType.MEETING_MINUTES,
+        {"meeting_title": "Launch sync", "notes": "1. Alice confirm rollout plan"},
+    )
+
+    assert marketing_call.name == "marketing_brief_tool"
+    assert marketing_result["data_status"] == "matched"
+    assert marketing_result["matched_rows"] == 2
+    assert marketing_result["source"] == "request_payload"
+    assert marketing_result["fallback_reason"] is None
+    assert marketing_result["filters"]["channels"] == ["email", "linkedin"]
+
+    assert support_call.name == "support_triage_tool"
+    assert support_result["data_status"] == "matched"
+    assert support_result["matched_rows"] == 1
+    assert support_result["source"] == "request_payload"
+    assert support_result["fallback_reason"] is None
+    assert support_result["filters"]["ticket_count"] == 1
+
+    assert meeting_call.name == "meeting_minutes_tool"
+    assert meeting_result["data_status"] == "matched"
+    assert meeting_result["matched_rows"] == 1
+    assert meeting_result["source"] == "request_payload"
+    assert meeting_result["fallback_reason"] is None
+    assert meeting_result["filters"]["meeting_title"] == "Launch sync"
+
+
+def test_support_external_data_failure_is_marked_as_fallback() -> None:
+    class FailingExternalData(ExternalDataService):
+        def load_support_tickets(self, source: dict) -> object:
+            raise ExternalDataError("provider unavailable")
+
+    tool_center = ToolCenter(FailingExternalData(Settings()))
+
+    raw_result, tool_call = tool_center.run_named(
+        "github_issues_tool",
+        {
+            "tickets": [{"customer": "ACME", "message": "production outage"}],
+            "data_source": {"provider": "github_issues", "repo": "acme/app"},
+        },
+    )
+
+    assert tool_call.name == "support_triage_tool"
+    assert raw_result["data_status"] == "fallback"
+    assert raw_result["matched_rows"] == 1
+    assert raw_result["source"] == "github_issues"
+    assert raw_result["fallback_reason"] == "provider unavailable"
+    assert raw_result["filters"]["provider"] == "github_issues"
+
+
+def test_meeting_tool_returns_no_match_when_no_action_items_are_extracted() -> None:
+    tool_center = ToolCenter(ExternalDataService(Settings()))
+
+    raw_result, tool_call = tool_center.run(
+        WorkflowType.MEETING_MINUTES,
+        {"meeting_title": "Empty sync", "notes": ""},
+    )
+
+    assert tool_call.name == "meeting_minutes_tool"
+    assert raw_result["data_status"] == "no_match"
+    assert raw_result["matched_rows"] == 0
+    assert raw_result["source"] == "request_payload"
+    assert raw_result["fallback_reason"] == "no_meeting_action_items_extracted"
+
+
+def test_reviewer_requires_human_review_for_untrusted_tool_data_status() -> None:
+    review = ReviewerAgent._rule_review(
+        WorkflowType.SUPPORT_TRIAGE,
+        {
+            "data_status": "fallback",
+            "matched_rows": 1,
+            "source": "github_issues",
+            "fallback_reason": "provider unavailable",
+            "tickets": [{"category": "general_inquiry"}],
+        },
+        {"summary": "external source unavailable"},
+        {"deliverables": {"reply_drafts": []}},
+    )
+
+    assert review["status"] == "waiting_human"
+    assert review["needs_human_review"] is True
+    assert review["score"] <= 0.55
+    assert any("fallback" in reason for reason in review["reasons"])
 
 
 def test_operator_falls_back_when_selected_tool_is_not_allowed() -> None:
